@@ -21,13 +21,12 @@ class DataConfig(StrictModel):
     dataset: Path = Path("DataExport_2026-07-10/dataset.json")
     output_dir: Path = Path("data/processed")
     session_gap_hours: int = 12
-    train_ratio: float = 0.8
-    validation_ratio: float = 0.1
+    train_ratio: float = 0.9
     test_ratio: float = 0.1
 
     @model_validator(mode="after")
     def validate_ratios(self) -> "DataConfig":
-        if abs(self.train_ratio + self.validation_ratio + self.test_ratio - 1.0) > 1e-9:
+        if abs(self.train_ratio + self.test_ratio - 1.0) > 1e-9:
             raise ValueError("data split ratios must add up to 1.0")
         return self
 

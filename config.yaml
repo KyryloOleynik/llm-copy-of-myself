@@ -8,8 +8,7 @@ data:
   dataset: DataExport_2026-07-10/dataset.json
   output_dir: data/processed
   session_gap_hours: 12
-  train_ratio: 0.8
-  validation_ratio: 0.1
+  train_ratio: 0.9
   test_ratio: 0.1
 
 model:

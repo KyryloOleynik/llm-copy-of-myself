@@ -43,7 +43,8 @@ with `nvidia-smi`; the 12 GB acceptance limit must be verified on the target PC.
 
 ## Important data gate
 
-`prepare-data` currently splits the existing `dataset.json` so the training
+`prepare-data` currently splits the existing `dataset.json` into chronological
+train and test sets so the training
 path can be tested. That file has not yet passed the plan's full redaction,
 deduplication, and audit requirements. Do not perform a real personal-data
 training run until those stages are implemented and manually reviewed.

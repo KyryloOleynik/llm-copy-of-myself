@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
-import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,14 +26,6 @@ def _read_json(path: Path) -> list[dict[str, Any]]:
     return value
 
 
-def _split_name(timestamp: str, boundaries: tuple[str, str]) -> str:
-    if timestamp <= boundaries[0]:
-        return "train"
-    if timestamp <= boundaries[1]:
-        return "validation"
-    return "test"
-
-
 def prepare_existing_dataset(config: AppConfig) -> dict[str, Any]:
     """Chronologically split examples per chat and write JSONL plus a manifest."""
     source = config.data.dataset
@@ -43,20 +34,17 @@ def prepare_existing_dataset(config: AppConfig) -> dict[str, Any]:
     for example in examples:
         by_chat.setdefault(example["chat_id"], []).append(example)
 
-    splits = {"train": [], "validation": [], "test": []}
+    splits = {"train": [], "test": []}
     split_boundaries: dict[str, dict[str, str | None]] = {}
     for chat_id, rows in by_chat.items():
         rows.sort(key=lambda row: (row["timestamp"], row["example_id"]))
         count = len(rows)
         train_end = max(1, int(count * config.data.train_ratio))
-        validation_end = max(train_end, int(count * (config.data.train_ratio + config.data.validation_ratio)))
-        validation_end = min(validation_end, count)
         for index, row in enumerate(rows):
-            split = "train" if index < train_end else "validation" if index < validation_end else "test"
+            split = "train" if index < train_end else "test"
             splits[split].append(row)
         split_boundaries[chat_id] = {
             "train_end": rows[train_end - 1]["timestamp"] if train_end else None,
-            "validation_end": rows[validation_end - 1]["timestamp"] if validation_end > train_end else None,
         }
 
     output = config.data.output_dir
@@ -65,6 +53,9 @@ def prepare_existing_dataset(config: AppConfig) -> dict[str, Any]:
         with (output / f"{name}.jsonl").open("w", encoding="utf-8") as target:
             for row in rows:
                 target.write(json.dumps(row, ensure_ascii=False) + "\n")
+    validation_path = output / "validation.jsonl"
+    if validation_path.exists():
+        validation_path.unlink()
 
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     manifest = {
@@ -144,15 +135,10 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
     set_seed(config.training.seed)
     output_dir = config.training.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    data_files = {
-        "train": str(config.data.output_dir / "train.jsonl"),
-        "validation": str(config.data.output_dir / "validation.jsonl"),
-    }
+    data_files = {"train": str(config.data.output_dir / "train.jsonl")}
     dataset = load_dataset("json", data_files=data_files)
     if smoke:
         dataset["train"] = dataset["train"].select(range(min(20, len(dataset["train"]))))
-        if len(dataset["validation"]):
-            dataset["validation"] = dataset["validation"].select(range(min(20, len(dataset["validation"]))))
 
     tokenizer = AutoTokenizer.from_pretrained(config.model.base_model, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -186,7 +172,6 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
     args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=config.training.micro_batch_size,
-        per_device_eval_batch_size=1,
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         learning_rate=config.training.learning_rate,
         num_train_epochs=config.training.epochs,
@@ -195,8 +180,7 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
         gradient_checkpointing=config.training.gradient_checkpointing,
         logging_steps=config.training.logging_steps,
         save_steps=config.training.save_steps,
-        eval_strategy="steps" if len(dataset["validation"]) else "no",
-        eval_steps=config.training.save_steps,
+        eval_strategy="no",
         save_total_limit=2,
         optim="paged_adamw_8bit",
         report_to="none",
@@ -208,7 +192,6 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"] if len(dataset["validation"]) else None,
         data_collator=ReplyOnlyCollator(tokenizer, config.model.sequence_length),
     )
     metadata = {
