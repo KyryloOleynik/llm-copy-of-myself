@@ -36,7 +36,10 @@ async def command_start_handler(message: Message) -> None:
     """
     await message.answer(
         f"Hello, {html.bold(message.from_user.full_name)}!\n\n"
-        f"I am a basic aiogram bot template. Send me any message, and I will echo it back!"
+        f"This bot communicates in a style similar to Rodion, including his usual tone, "
+        f"vocabulary, humor, message length, and language-switching habits.\n\n"
+        f"When relevant, I can also provide information about Rodion's scheduled plans "
+        f"from his Google Calendar."
     )
 
 
@@ -57,6 +60,22 @@ async def echo_handler(message: Message) -> None:
 async def main() -> None:
     # Initialize Bot instance with default HTML parsing mode
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    # Set bot description and short description automatically on startup
+    logging.info("Setting bot descriptions...")
+    try:
+        await bot.set_my_description(
+            "This bot communicates in a style similar to Rodion, including his usual tone, "
+            "vocabulary, humor, message length, and language-switching habits. When relevant, "
+            "it can also provide information about Rodion's scheduled plans from his Google Calendar. "
+            "It is an AI representation and may not always accurately reflect Rodion's current thoughts or intentions."
+        )
+        await bot.set_my_short_description(
+            "An AI bot that communicates like Rodion and can share his scheduled plans."
+        )
+        logging.info("Bot descriptions set successfully.")
+    except Exception as e:
+        logging.error(f"Failed to set bot descriptions: {e}")
 
     logging.info("Starting bot...")
     # Run the event dispatcher
