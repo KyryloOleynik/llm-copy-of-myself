@@ -1,0 +1,17 @@
+# Native Windows / NVIDIA CUDA 12.8 training environment.
+# The PyTorch index supplies the CUDA wheel; PyPI supplies the remaining packages.
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+
+torch>=2.7,<3
+accelerate>=1.2,<2
+bitsandbytes>=0.45,<1
+datasets>=3.2,<5
+numpy>=1.26,<3
+peft>=0.14,<1
+safetensors>=0.5,<1
+transformers>=4.51,<5
+trl>=0.15,<1
+
+# Installs this repository and its YAML, validation, and CLI dependencies.
+-e .

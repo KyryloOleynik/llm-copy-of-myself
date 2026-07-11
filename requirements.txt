@@ -1,0 +1,3 @@
+# Cross-platform bot/runtime dependencies. Training dependencies are kept in
+# requirements-windows-cuda.txt because PyTorch/CUDA must be installed first.
+-e .[bot]

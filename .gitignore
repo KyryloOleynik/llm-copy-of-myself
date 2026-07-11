@@ -6,4 +6,6 @@ __pycache__/
 .idea/
 .agents/
 .env
-
+data/processed/
+artifacts/
+*.egg-info/
