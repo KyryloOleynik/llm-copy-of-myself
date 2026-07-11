@@ -42,7 +42,7 @@ BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen3-8B")
 ADAPTER_PATH = Path(
     os.getenv("ADAPTER_PATH", str(ROOT / "artifacts/training/qwen3-8b-r16/adapter-final"))
 )
-MIN_REPLY_DELAY = float(os.getenv("MIN_REPLY_DELAY", "5"))
+MIN_REPLY_DELAY = float(os.getenv("MIN_REPLY_DELAY", "2"))
 MAX_REPLY_DELAY = float(os.getenv("MAX_REPLY_DELAY", "60"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
@@ -240,7 +240,9 @@ async def wait_and_reply(pending: PendingChat) -> None:
             )
         )
         reply = await result
-        await pending.bot.send_message(pending.chat_id, reply)
+        for part in (line.strip() for line in reply.splitlines()):
+            if part:
+                await pending.bot.send_message(pending.chat_id, part)
     except asyncio.CancelledError:
         raise
     except Exception:
