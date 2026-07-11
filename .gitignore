@@ -5,3 +5,7 @@ __pycache__/
 .vscode/
 .idea/
 .agents/
+.env
+data/processed/
+artifacts/
+*.egg-info/

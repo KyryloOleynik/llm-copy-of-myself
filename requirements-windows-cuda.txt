@@ -1,0 +1,3 @@
+# Install CUDA-enabled PyTorch first (see WINDOWS_TRAINING.md), then run:
+#   py -3.11 -m pip install -r requirements-windows-cuda.txt
+-e .[train,dev]

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Clean a Telegram JSON export and split chats into training sessions."""
 
-import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -221,16 +220,15 @@ def clean_export(source):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=Path)
-    parser.add_argument("output", type=Path)
-    args = parser.parse_args()
+    project_dir = Path(__file__).resolve().parent
+    source_path = project_dir / "DataExport_2026-07-10" / "result.json"
+    output_path = project_dir / "DataExport_2026-07-10" / "cleaned_sessions.json"
 
-    with args.source.open("r", encoding="utf-8") as source_file:
+    with source_path.open("r", encoding="utf-8") as source_file:
         source = json.load(source_file)
 
     cleaned = clean_export(source)
-    with args.output.open("w", encoding="utf-8") as output_file:
+    with output_path.open("w", encoding="utf-8") as output_file:
         json.dump(cleaned, output_file, ensure_ascii=False, indent=2)
 
     print(json.dumps(cleaned["stats"], ensure_ascii=False, indent=2))
