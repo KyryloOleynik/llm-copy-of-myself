@@ -1,0 +1,35 @@
+project:
+  name: personal-telegram-ai-bot
+  owner_from_id: user624349412
+
+data:
+  source: DataExport_2026-07-10/result.json
+  cleaned: DataExport_2026-07-10/cleaned_sessions.json
+  session_gap_hours: 12
+  train_ratio: 0.8
+  validation_ratio: 0.1
+  test_ratio: 0.1
+
+model:
+  base_model: Qwen/Qwen3-8B
+  sequence_length: 1024
+  thinking_enabled: false
+
+training:
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  learning_rate: 0.0001
+  micro_batch_size: 1
+  gradient_accumulation_steps: 16
+  epochs: 1
+  gradient_checkpointing: true
+
+retrieval:
+  database: data/retrieval.sqlite3
+  context_limit: 8192
+
+bot:
+  polling: true
+  state_database: data/bot.sqlite3
+  model_server_url: http://127.0.0.1:8080/v1
