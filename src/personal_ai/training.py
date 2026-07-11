@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +18,62 @@ TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 ]
+
+
+def _checkpoint_is_resumable(path: Path) -> bool:
+    weight_names = (
+        "adapter_model.safetensors", "adapter_model.bin",
+        "model.safetensors", "pytorch_model.bin",
+    )
+    return (
+        any((path / name).is_file() for name in weight_names)
+        and (path / "trainer_state.json").is_file()
+        and (path / "optimizer.pt").is_file()
+        and (path / "scheduler.pt").is_file()
+    )
+
+
+def _latest_valid_checkpoint(output_dir: Path) -> Path | None:
+    """Return the newest complete, resumable Trainer checkpoint."""
+    candidates: list[tuple[int, Path]] = []
+    for path in output_dir.glob("checkpoint-*"):
+        match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+        if match and path.is_dir():
+            candidates.append((int(match.group(1)), path))
+
+    for _, path in sorted(candidates, reverse=True):
+        if _checkpoint_is_resumable(path):
+            return path
+    return None
+
+
+def _save_interrupted_checkpoint(trainer: Any, tokenizer: Any, output_dir: Path) -> Path:
+    """Save into staging, verify it, and only then expose checkpoint-N."""
+    step = trainer.state.global_step
+    staging_root = output_dir / ".interrupt-checkpoint-staging"
+    staging_checkpoint = staging_root / f"checkpoint-{step}"
+    final_checkpoint = output_dir / f"checkpoint-{step}"
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    staging_root.mkdir(parents=True)
+
+    original_output_dir = trainer.args.output_dir
+    try:
+        trainer.args.output_dir = str(staging_root)
+        trainer._save_checkpoint(trainer.model, trial=None)
+        tokenizer.save_pretrained(str(staging_checkpoint))
+    finally:
+        trainer.args.output_dir = original_output_dir
+
+    if not _checkpoint_is_resumable(staging_checkpoint):
+        raise RuntimeError(
+            f"Checkpoint save was incomplete; files were kept at {staging_checkpoint}"
+        )
+    if final_checkpoint.exists():
+        shutil.rmtree(final_checkpoint)
+    staging_checkpoint.replace(final_checkpoint)
+    shutil.rmtree(staging_root)
+    return final_checkpoint
 
 
 def _read_json(path: Path) -> list[dict[str, Any]]:
@@ -115,11 +173,16 @@ class ReplyOnlyCollator:
         }
 
 
-def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> None:
+def train(
+    config: AppConfig,
+    smoke: bool = False,
+    resume: str | None = None,
+    fresh: bool = False,
+) -> None:
     try:
         import torch
         from datasets import load_dataset
-        from peft import LoraConfig, prepare_model_for_kbit_training
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
         from transformers import (
             AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
             Trainer, TrainingArguments, set_seed,
@@ -135,6 +198,18 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
     set_seed(config.training.seed)
     output_dir = config.training.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    if fresh and resume is not None:
+        raise ValueError("Use either --fresh or --resume, not both")
+    last_checkpoint_path = _latest_valid_checkpoint(output_dir)
+    last_checkpoint = str(last_checkpoint_path) if last_checkpoint_path else None
+    if resume == "last":
+        resume = last_checkpoint
+        if resume is None:
+            raise RuntimeError(f"No checkpoint found in {output_dir}")
+    elif resume is None and not fresh:
+        resume = last_checkpoint
+        if resume is not None:
+            print(f"Automatically resuming from {resume}")
     data_files = {"train": str(config.data.output_dir / "train.jsonl")}
     dataset = load_dataset("json", data_files=data_files)
     if smoke:
@@ -152,7 +227,7 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
     model = AutoModelForCausalLM.from_pretrained(
         config.model.base_model,
         quantization_config=quantization,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": 0},
         attn_implementation="sdpa",
     )
@@ -160,7 +235,7 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=config.training.gradient_checkpointing
     )
-    model.add_adapter(LoraConfig(
+    model = get_peft_model(model, LoraConfig(
         r=config.training.lora_rank,
         lora_alpha=config.training.lora_alpha,
         lora_dropout=config.training.lora_dropout,
@@ -204,6 +279,19 @@ def train(config: AppConfig, smoke: bool = False, resume: str | None = None) -> 
         "seed": config.training.seed,
     }
     (output_dir / "reproducibility.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    trainer.train(resume_from_checkpoint=resume or None)
+    try:
+        trainer.train(resume_from_checkpoint=resume or None)
+    except KeyboardInterrupt:
+        # A normal Trainer save includes the adapter, optimizer, scheduler, RNG,
+        # and trainer state, so this checkpoint can be resumed rather than merely
+        # used for inference. Ctrl+C may take a moment to reach this handler while
+        # a CUDA kernel is finishing.
+        checkpoint = _save_interrupted_checkpoint(trainer, tokenizer, output_dir)
+        print(
+            f"\nInterrupted safely at optimizer step {trainer.state.global_step}: "
+            f"{checkpoint}. "
+            "Resume with: personal-ai train --resume last"
+        )
+        return
     trainer.save_model(str(output_dir / "adapter-final"))
     tokenizer.save_pretrained(str(output_dir / "adapter-final"))

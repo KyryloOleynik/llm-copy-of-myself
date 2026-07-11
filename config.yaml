@@ -13,7 +13,7 @@ data:
 
 model:
   base_model: Qwen/Qwen3-8B
-  sequence_length: 1024
+  sequence_length: 512
   thinking_enabled: false
 
 training:
@@ -27,7 +27,8 @@ training:
   epochs: 1
   gradient_checkpointing: true
   logging_steps: 5
-  save_steps: 100
+  # Optimizer steps (each is 16 micro-batches with the settings above).
+  save_steps: 10
   seed: 42
 
 retrieval:
