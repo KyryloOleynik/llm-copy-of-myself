@@ -30,10 +30,14 @@ def merge_turns(messages):
     turns = []
     for message in messages:
         content = message_text(message)
-        if not content:
+        if not content.strip():
             continue
 
         role = "assistant" if message.get("from_id") == OWNER_ID else "user"
+
+        if len(content) > 500 and role == "assistant":
+            return None
+
         if turns and turns[-1]["role"] == role:
             turns[-1]["content"] += "\n" + content
             turns[-1]["source_message_ids"].append(message.get("id"))
@@ -53,6 +57,10 @@ def build_examples(cleaned):
     for chat in cleaned["chats"]:
         for session in chat["sessions"]:
             turns = merge_turns(session["messages"])
+
+            if not turns:
+                continue
+
             for index, target in enumerate(turns):
                 if target["role"] != "assistant" or index == 0:
                     continue
