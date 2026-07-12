@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import platform
 import re
 import shutil
@@ -11,20 +10,19 @@ from pathlib import Path
 from typing import Any
 
 from personal_ai.config import AppConfig
-from personal_ai.tokenization import token_ids
+from personal_ai.modeling import load_quantized_base, load_tokenizer, select_language_lora_modules
+from personal_ai.utils import assistant_target_ids, iter_jsonl, read_json, write_json
 
 
 IGNORE_INDEX = -100
-TOKEN_MIXER_SUFFIXES = {
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
-}
 
 
 def _checkpoint_is_resumable(path: Path) -> bool:
     weight_names = (
-        "adapter_model.safetensors", "adapter_model.bin",
-        "model.safetensors", "pytorch_model.bin",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+        "model.safetensors",
+        "pytorch_model.bin",
     )
     return (
         any((path / name).is_file() for name in weight_names)
@@ -92,25 +90,14 @@ class ReplyOnlyCollator:
         encoded_examples = []
         for example in examples:
             messages = example["messages"]
-            if not messages or messages[-1]["role"] != "assistant":
-                raise ValueError("Every example must end with the target assistant message")
-            prompt_ids = self.tokenizer.apply_chat_template(
-                messages[:-1], tokenize=True, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            full_ids = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=False,
-                enable_thinking=False,
-            )
-            prompt_ids = token_ids(prompt_ids)
-            full_ids = token_ids(full_ids)
-            if full_ids[: len(prompt_ids)] != prompt_ids:
-                self.audit["prompt_prefix_mismatch"] += 1
-                raise ValueError("Prompt is not a prefix of the complete example")
-            target_ids = full_ids[len(prompt_ids):]
-            if not target_ids:
-                self.audit["zero_label_example"] += 1
-                raise ValueError("Example has no trainable assistant target tokens")
+            try:
+                prompt_ids, full_ids, target_ids = assistant_target_ids(self.tokenizer, messages)
+            except ValueError as exc:
+                if "prefix" in str(exc):
+                    self.audit["prompt_prefix_mismatch"] += 1
+                else:
+                    self.audit["zero_label_example"] += 1
+                raise
             if len(target_ids) > self.max_target_tokens:
                 self.audit["oversized_target"] += 1
                 raise ValueError(
@@ -142,37 +129,12 @@ class ReplyOnlyCollator:
         }
 
 
-def select_language_lora_modules(model: Any) -> list[str]:
-    """Select exact Qwen3.5 language token-mixer paths, never vision modules."""
-    selected: list[str] = []
-    observed: Counter[str] = Counter()
-    for name, module in model.named_modules():
-        suffix = name.rsplit(".", 1)[-1]
-        if suffix not in TOKEN_MIXER_SUFFIXES or not hasattr(module, "weight"):
-            continue
-        lowered = name.casefold()
-        if "vision" in lowered or "visual" in lowered:
-            continue
-        if "language_model" not in lowered:
-            continue
-        selected.append(name)
-        observed[suffix] += 1
-    missing = sorted(TOKEN_MIXER_SUFFIXES - set(observed))
-    if missing:
-        raise RuntimeError(f"Qwen3.5 language projections are missing: {missing}")
-    if not selected:
-        raise RuntimeError("No Qwen3.5 language-model LoRA modules were selected")
-    if any("vision" in name.casefold() or "visual" in name.casefold() for name in selected):
-        raise RuntimeError("A vision module was selected for LoRA")
-    return selected
-
-
 def validate_prepared_dataset(config: AppConfig) -> dict[str, Any]:
     """Fail before training when dataset invariants or privacy acknowledgement drift."""
     manifest_path = config.data.output_dir / "manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError("Prepared manifest is missing; run personal-ai prepare-data")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_json(manifest_path)
     if manifest.get("model") != config.model.base_model:
         raise RuntimeError("Prepared dataset tokenizer model differs from training model")
     if manifest.get("sequence_length") != config.model.sequence_length:
@@ -184,19 +146,17 @@ def validate_prepared_dataset(config: AppConfig) -> dict[str, Any]:
         path = config.data.output_dir / f"{split}.jsonl"
         if not path.is_file():
             raise RuntimeError(f"Prepared split is missing: {path}")
-        with path.open("r", encoding="utf-8") as source:
-            for line_number, line in enumerate(source, 1):
-                row = json.loads(line)
-                if row.get("split") != split:
-                    raise ValueError(f"{path}:{line_number} has the wrong split")
-                session_id = row["session_id"]
-                previous = session_splits.setdefault(session_id, split)
-                if previous != split:
-                    raise ValueError(f"Session {session_id} crosses {previous}/{split}")
-                if row["sequence_tokens"] > config.model.sequence_length:
-                    raise ValueError(f"{row['example_id']} exceeds the sequence limit")
-                if not 0 < row["target_tokens"] <= config.data.max_target_tokens:
-                    raise ValueError(f"{row['example_id']} has invalid target length")
+        for line_number, row in enumerate(iter_jsonl(path), 1):
+            if row.get("split") != split:
+                raise ValueError(f"{path}:{line_number} has the wrong split")
+            session_id = row["session_id"]
+            previous = session_splits.setdefault(session_id, split)
+            if previous != split:
+                raise ValueError(f"Session {session_id} crosses {previous}/{split}")
+            if row["sequence_tokens"] > config.model.sequence_length:
+                raise ValueError(f"{row['example_id']} exceeds the sequence limit")
+            if not 0 < row["target_tokens"] <= config.data.max_target_tokens:
+                raise ValueError(f"{row['example_id']} has invalid target length")
     return manifest
 
 
@@ -205,7 +165,7 @@ def require_successful_smoke(config: AppConfig, dataset_sha256: str) -> dict[str
     path = config.training.output_dir / "smoke-test.json"
     if not path.is_file():
         raise RuntimeError("Run personal-ai train --smoke --fresh before full training")
-    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata = read_json(path)
     if metadata.get("model") != config.model.base_model:
         raise RuntimeError("Smoke test used a different base model")
     if metadata.get("dataset_sha256") != dataset_sha256:
@@ -232,10 +192,7 @@ def train(
         import torch
         from datasets import load_dataset
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        from transformers import (
-            AutoModelForMultimodalLM, AutoTokenizer, BitsAndBytesConfig,
-            Trainer, TrainingArguments, set_seed,
-        )
+        from transformers import Trainer, TrainingArguments, set_seed
     except ImportError as exc:
         raise RuntimeError("Training dependencies are missing; install .[train]") from exc
 
@@ -269,43 +226,33 @@ def train(
     }
     dataset = load_dataset("json", data_files=data_files)
     if smoke:
-        dataset["train"] = dataset["train"].select(
-            longest_example_indices(dataset["train"], 20)
-        )
+        dataset["train"] = dataset["train"].select(longest_example_indices(dataset["train"], 20))
         dataset["validation"] = dataset["validation"].select(
             longest_example_indices(dataset["validation"], 20)
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model.base_model, use_fast=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    quantization = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    model = AutoModelForMultimodalLM.from_pretrained(
-        config.model.base_model,
-        quantization_config=quantization,
-        dtype=torch.bfloat16,
-        device_map={"": 0},
-    )
+    tokenizer = load_tokenizer(config.model.base_model)
+    model = load_quantized_base(config.model.base_model, torch, {"": 0})
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=config.training.gradient_checkpointing
     )
     target_modules = select_language_lora_modules(model)
-    model = get_peft_model(model, LoraConfig(
-        r=config.training.lora_rank,
-        lora_alpha=config.training.lora_alpha,
-        lora_dropout=config.training.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=target_modules,
-    ))
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            r=config.training.lora_rank,
+            lora_alpha=config.training.lora_alpha,
+            lora_dropout=config.training.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+        ),
+    )
 
-    trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    trainable_names = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
     if not trainable_names or any(
         "vision" in name.casefold() or "visual" in name.casefold() for name in trainable_names
     ):
@@ -356,12 +303,13 @@ def train(
         "gpu": torch.cuda.get_device_name(0),
         "smoke": smoke,
         "seed": config.training.seed,
+        "training_method": config.training.method,
         "model": config.model.base_model,
         "dataset_sha256": manifest["dataset_sha256"],
         "lora_target_modules": target_modules,
         "trainable_parameter_names": trainable_names,
     }
-    (output_dir / "reproducibility.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    write_json(output_dir / "reproducibility.json", metadata)
     try:
         torch.cuda.reset_peak_memory_stats()
         trainer.train(resume_from_checkpoint=resume or None)
@@ -379,12 +327,8 @@ def train(
         return
     metadata["peak_vram_allocated_bytes"] = torch.cuda.max_memory_allocated()
     metadata["peak_vram_reserved_bytes"] = torch.cuda.max_memory_reserved()
-    (output_dir / "reproducibility.json").write_text(
-        json.dumps(metadata, indent=2), encoding="utf-8"
-    )
+    write_json(output_dir / "reproducibility.json", metadata)
     if smoke:
-        (experiment_dir / "smoke-test.json").write_text(
-            json.dumps(metadata, indent=2), encoding="utf-8"
-        )
+        write_json(experiment_dir / "smoke-test.json", metadata)
     trainer.save_model(str(output_dir / "adapter-final"))
     tokenizer.save_pretrained(str(output_dir / "adapter-final"))

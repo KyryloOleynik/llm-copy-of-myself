@@ -42,12 +42,15 @@ class DataConfig(StrictModel):
                 "This project intentionally contains unredacted private data; "
                 "set data.contains_unredacted_private_data to true to acknowledge it"
             )
-        if abs(
-            self.personal_data_ratio
-            + self.context_retention_ratio
-            + self.general_reasoning_ratio
-            - 1.0
-        ) > 1e-9:
+        if (
+            abs(
+                self.personal_data_ratio
+                + self.context_retention_ratio
+                + self.general_reasoning_ratio
+                - 1.0
+            )
+            > 1e-9
+        ):
             raise ValueError("data mixture ratios must add up to 1.0")
         if self.personal_data_ratio <= 0:
             raise ValueError("personal_data_ratio must be greater than zero")
@@ -67,6 +70,7 @@ class ModelConfig(StrictModel):
 
 
 class TrainingConfig(StrictModel):
+    method: str = "qlora"
     output_dir: Path = Path("artifacts/training/qwen3.5-4b-r16")
     lora_rank: int = 16
     lora_alpha: int = 32
@@ -86,6 +90,8 @@ class TrainingConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_policy(self) -> "TrainingConfig":
+        if self.method != "qlora":
+            raise ValueError("Only training.method: qlora is supported on the 12 GiB target")
         if self.lora_target_policy != "language-token-mixers":
             raise ValueError("Only lora_target_policy: language-token-mixers is supported")
         if self.save_steps % self.eval_steps != 0:

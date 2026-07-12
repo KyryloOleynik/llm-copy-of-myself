@@ -5,6 +5,8 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+from personal_ai.utils import read_json, write_json
+
 
 SESSION_GAP_SECONDS = 12 * 60 * 60
 
@@ -117,7 +119,7 @@ def clean_message(message):
     return deepcopy(message)
 
 
-def split_sessions(messages):
+def split_messages_into_sessions(messages):
     sessions = []
     current = []
     previous_timestamp = None
@@ -176,7 +178,7 @@ def clean_export(source):
             stats["chats_with_one_or_fewer_messages_removed"] += 1
             continue
 
-        sessions = split_sessions(cleaned_messages)
+        sessions = split_messages_into_sessions(cleaned_messages)
         output_chats.append(
             {
                 "name": chat.get("name"),
@@ -223,12 +225,8 @@ def main():
     source_path = project_dir / "DataExport_2026-07-10" / "result.json"
     output_path = project_dir / "DataExport_2026-07-10" / "cleaned_sessions.json"
 
-    with source_path.open("r", encoding="utf-8") as source_file:
-        source = json.load(source_file)
-
-    cleaned = clean_export(source)
-    with output_path.open("w", encoding="utf-8") as output_file:
-        json.dump(cleaned, output_file, ensure_ascii=False, indent=2)
+    cleaned = clean_export(read_json(source_path))
+    write_json(output_path, cleaned, sort_keys=False)
 
     print(json.dumps(cleaned["stats"], ensure_ascii=False, indent=2))
 

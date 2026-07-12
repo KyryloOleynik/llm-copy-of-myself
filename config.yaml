@@ -26,6 +26,7 @@ model:
   thinking_enabled: false
 
 training:
+  method: qlora
   output_dir: artifacts/training/qwen3.5-4b-r16
   lora_rank: 16
   lora_alpha: 32

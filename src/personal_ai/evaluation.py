@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import gc
-import json
 import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from personal_ai.config import AppConfig
-from personal_ai.prompts import relationship_system_message
-from personal_ai.tokenization import token_ids
+from personal_ai.modeling import generate_reply, load_inference_model
 from personal_ai.training import validate_prepared_dataset
+from personal_ai.utils import (
+    iter_jsonl,
+    read_json,
+    relationship_system_message,
+    render_chat_ids,
+    write_json,
+)
 
 
 DISTANCES = (256, 512, 768, 1024, 2048, 4096, 8192)
@@ -22,27 +27,32 @@ def _diagnostic_cases(distance: int) -> list[dict[str, Any]]:
         {
             "id": f"delayed-recall-{distance}",
             "category": "context",
-            "messages": [{
-                "role": "user",
-                "content": (
-                    "Remember that the project codename is COBALT." + filler
-                    + " What is the project codename? Answer with the codename only."
-                ),
-            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Remember that the project codename is COBALT."
+                        + filler
+                        + " What is the project codename? Answer with the codename only."
+                    ),
+                }
+            ],
             "expected": ["cobalt"],
             "target_distance": distance,
         },
         {
             "id": f"corrected-state-{distance}",
             "category": "context",
-            "messages": [{
-                "role": "user",
-                "content": (
-                    "The meeting was first planned for Tuesday, but it was changed to Monday."
-                    + filler
-                    + " Which day is the meeting now? Answer with the day only."
-                ),
-            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "The meeting was first planned for Tuesday, but it was changed to Monday."
+                        + filler
+                        + " Which day is the meeting now? Answer with the day only."
+                    ),
+                }
+            ],
             "expected": ["monday"],
             "target_distance": distance,
         },
@@ -50,7 +60,10 @@ def _diagnostic_cases(distance: int) -> list[dict[str, Any]]:
             "id": f"instruction-persistence-{distance}",
             "category": "context",
             "messages": [
-                {"role": "system", "content": "Every answer must be valid JSON with a key named answer."},
+                {
+                    "role": "system",
+                    "content": "Every answer must be valid JSON with a key named answer.",
+                },
                 {"role": "user", "content": filler + " What is two plus two?"},
             ],
             "expected": ['"answer"', "4"],
@@ -64,22 +77,31 @@ def _reasoning_cases() -> list[dict[str, Any]]:
         {
             "id": "reasoning-arithmetic",
             "category": "reasoning",
-            "messages": [{"role": "user", "content": "A box has 7 rows of 8 items. How many items?"}],
+            "messages": [
+                {"role": "user", "content": "A box has 7 rows of 8 items. How many items?"}
+            ],
             "expected": ["56"],
         },
         {
             "id": "reasoning-latest-value",
             "category": "reasoning",
-            "messages": [{
-                "role": "user",
-                "content": "I had 12 files, deleted 3, then added 5. How many files do I have?",
-            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "I had 12 files, deleted 3, then added 5. How many files do I have?",
+                }
+            ],
             "expected": ["14"],
         },
         {
             "id": "multilingual-ukrainian",
             "category": "reasoning",
-            "messages": [{"role": "user", "content": "В Олени було 9 книг, вона віддала 4. Скільки залишилось?"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "В Олени було 9 книг, вона віддала 4. Скільки залишилось?",
+                }
+            ],
             "expected": ["5"],
         },
         {
@@ -98,7 +120,8 @@ def _candidate_paths(output_dir: Path) -> list[Path | None]:
     candidates: list[Path | None] = [None]
     checkpoints = sorted(
         (
-            path for path in output_dir.glob("checkpoint-*")
+            path
+            for path in output_dir.glob("checkpoint-*")
             if path.is_dir() and (path / "adapter_config.json").is_file()
         ),
         key=lambda path: int(path.name.rsplit("-", 1)[-1]),
@@ -110,52 +133,6 @@ def _candidate_paths(output_dir: Path) -> list[Path | None]:
     return candidates
 
 
-def _load_model(config: AppConfig, adapter: Path | None) -> tuple[Any, Any, Any]:
-    import torch
-    from peft import PeftModel
-    from transformers import AutoModelForMultimodalLM, AutoTokenizer, BitsAndBytesConfig
-
-    tokenizer_source = adapter if adapter is not None else config.model.base_model
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    quantization = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    model = AutoModelForMultimodalLM.from_pretrained(
-        config.model.base_model,
-        quantization_config=quantization,
-        dtype=torch.bfloat16,
-        device_map={"": 0},
-    )
-    if adapter is not None:
-        model = PeftModel.from_pretrained(model, adapter)
-    model.eval()
-    return torch, tokenizer, model
-
-
-def _generate(torch: Any, tokenizer: Any, model: Any, messages: list[dict[str, str]]) -> tuple[str, int]:
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=128,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    generated = output[0, inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip(), inputs["input_ids"].shape[1]
-
-
 def _messages_at_distance(
     tokenizer: Any, messages: list[dict[str, str]], target_tokens: int | None
 ) -> list[dict[str, str]]:
@@ -165,12 +142,9 @@ def _messages_at_distance(
         return copied
     filler = " We briefly discussed an unrelated ordinary topic."
     base = [
-        {**message, "content": message["content"].replace("{FILLER}", "")}
-        for message in copied
+        {**message, "content": message["content"].replace("{FILLER}", "")} for message in copied
     ]
-    base_ids = token_ids(tokenizer.apply_chat_template(
-        base, tokenize=True, add_generation_prompt=True, enable_thinking=False
-    ))
+    base_ids = render_chat_ids(tokenizer, base, generation=True)
     filler_tokens = max(1, len(tokenizer.encode(filler, add_special_tokens=False)))
     repeats = max(0, (target_tokens - len(base_ids)) // filler_tokens)
     while True:
@@ -178,9 +152,7 @@ def _messages_at_distance(
             {**message, "content": message["content"].replace("{FILLER}", filler * repeats)}
             for message in copied
         ]
-        rendered = token_ids(tokenizer.apply_chat_template(
-            materialized, tokenize=True, add_generation_prompt=True, enable_thinking=False
-        ))
+        rendered = render_chat_ids(tokenizer, materialized, generation=True)
         if len(rendered) > target_tokens and repeats:
             repeats -= 1
             continue
@@ -188,9 +160,7 @@ def _messages_at_distance(
             {**message, "content": message["content"].replace("{FILLER}", filler * (repeats + 1))}
             for message in copied
         ]
-        next_ids = token_ids(tokenizer.apply_chat_template(
-            next_messages, tokenize=True, add_generation_prompt=True, enable_thinking=False
-        ))
+        next_ids = render_chat_ids(tokenizer, next_messages, generation=True)
         return next_messages if len(next_ids) <= target_tokens else materialized
 
 
@@ -205,7 +175,7 @@ def _style_rating(config: AppConfig, candidate: str) -> tuple[int, int]:
     path = config.data.output_dir / "style_ratings.json"
     if not path.is_file():
         return 0, 0
-    ratings = json.loads(path.read_text(encoding="utf-8")).get(candidate, {})
+    ratings = read_json(path).get(candidate, {})
     wins, total = int(ratings.get("wins", 0)), int(ratings.get("total", 0))
     if wins < 0 or total < 0 or wins > total:
         raise ValueError(f"Invalid blind style rating for {candidate}: {wins}/{total}")
@@ -216,7 +186,7 @@ def _training_vram_ok(config: AppConfig) -> tuple[bool, int | None]:
     path = config.training.output_dir / "reproducibility.json"
     if not path.is_file():
         return False, None
-    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata = read_json(path)
     peak = metadata.get("peak_vram_reserved_bytes")
     return bool(peak is not None and peak < 12 * 1024**3), peak
 
@@ -226,39 +196,54 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
     manifest = validate_prepared_dataset(config)
     cases = [case for distance in DISTANCES for case in _diagnostic_cases(distance)]
     cases.extend(_reasoning_cases())
-    test_rows = [
-        json.loads(line)
-        for line in (config.data.output_dir / "test.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    test_rows = list(iter_jsonl(config.data.output_dir / "test.jsonl"))
     sample_rng = random.Random(config.training.seed)
     style_sample = sample_rng.sample(test_rows, min(50, len(test_rows)))
     style_outputs: dict[str, dict[str, str]] = {}
     results: dict[str, Any] = {}
     for adapter in _candidate_paths(config.training.output_dir):
         candidate = "base" if adapter is None else adapter.name
-        torch, tokenizer, model = _load_model(config, adapter)
+        torch, tokenizer, model = load_inference_model(config.model.base_model, adapter, {"": 0})
         rows = []
         for case in cases:
             messages = _messages_at_distance(
                 tokenizer, case["messages"], case.get("target_distance")
             )
-            output, actual_tokens = _generate(torch, tokenizer, model, messages)
-            rows.append({
-                "id": case["id"],
-                "category": case["category"],
-                "target_distance": case.get("target_distance"),
-                "actual_prompt_tokens": actual_tokens,
-                "output": output,
-                "passed": _score_case(output, case["expected"]),
-            })
+            output, actual_tokens = generate_reply(
+                torch,
+                tokenizer,
+                model,
+                messages,
+                max_new_tokens=128,
+                do_sample=False,
+            )
+            rows.append(
+                {
+                    "id": case["id"],
+                    "category": case["category"],
+                    "target_distance": case.get("target_distance"),
+                    "actual_prompt_tokens": actual_tokens,
+                    "output": output,
+                    "passed": _score_case(output, case["expected"]),
+                }
+            )
         scores: dict[str, float] = {}
         for category in ("context", "reasoning"):
-            scored = [row for row in rows if row["category"] == category and row["passed"] is not None]
+            scored = [
+                row for row in rows if row["category"] == category and row["passed"] is not None
+            ]
             scores[category] = sum(bool(row["passed"]) for row in scored) / len(scored)
         wins, total = _style_rating(config, candidate)
         style_outputs[candidate] = {}
         for row in style_sample:
-            output, _ = _generate(torch, tokenizer, model, row["messages"][:-1])
+            output, _ = generate_reply(
+                torch,
+                tokenizer,
+                model,
+                row["messages"][:-1],
+                max_new_tokens=128,
+                do_sample=False,
+            )
             style_outputs[candidate][row["example_id"]] = output
         results[candidate] = {
             "adapter": str(adapter) if adapter else None,
@@ -287,8 +272,7 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
             reasons.append("held-out style sample is empty")
         elif result["style_total"] < len(style_sample):
             reasons.append(
-                f"blind style ratings are incomplete: "
-                f"{result['style_total']}/{len(style_sample)}"
+                f"blind style ratings are incomplete: {result['style_total']}/{len(style_sample)}"
             )
         elif result["style_win_rate"] < 0.60:
             reasons.append("blind style win rate is below 60%")
@@ -307,10 +291,7 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
         "results": results,
     }
     report_path = output_dir / "evaluation.json"
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(report_path, report)
     _write_blind_style_template(config, output_dir, style_sample, style_outputs)
     return report_path
 
@@ -335,15 +316,17 @@ def _write_blind_style_template(
                 output_a, output_b, adapter_label = base_output, adapter_output, "B"
             else:
                 output_a, output_b, adapter_label = adapter_output, base_output, "A"
-            reviews.append({
-                "review_id": review_id,
-                "relationship": row["relationship"],
-                "messages": row["messages"][:-1],
-                "reference_reply": row["messages"][-1]["content"],
-                "output_a": output_a,
-                "output_b": output_b,
-                "preferred": None,
-            })
+            reviews.append(
+                {
+                    "review_id": review_id,
+                    "relationship": row["relationship"],
+                    "messages": row["messages"][:-1],
+                    "reference_reply": row["messages"][-1]["content"],
+                    "output_a": output_a,
+                    "output_b": output_b,
+                    "preferred": None,
+                }
+            )
             answer_key[candidate][review_id] = adapter_label
     template = {
         "instructions": (
@@ -353,11 +336,5 @@ def _write_blind_style_template(
         ),
         "reviews": reviews,
     }
-    (output_dir / "blind_style_review.json").write_text(
-        json.dumps(template, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (output_dir / "blind_style_key.json").write_text(
-        json.dumps(answer_key, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(output_dir / "blind_style_review.json", template)
+    write_json(output_dir / "blind_style_key.json", answer_key)

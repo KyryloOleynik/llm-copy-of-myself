@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from personal_ai.tokenization import token_ids
+from personal_ai.utils import assistant_target_ids
 
 
 SYSTEM_PROMPT = (
@@ -11,15 +11,6 @@ SYSTEM_PROMPT = (
     "persistent instructions, and solve the user's task accurately. Return only the final "
     "answer unless an output format is explicitly requested."
 )
-
-
-def _render(tokenizer: Any, messages: list[dict[str, str]], generation: bool) -> list[int]:
-    return token_ids(tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=generation,
-        enable_thinking=False,
-    ))
 
 
 def _row(
@@ -31,11 +22,8 @@ def _row(
     max_length: int,
     max_target_tokens: int,
 ) -> dict[str, Any]:
-    prompt_ids = _render(tokenizer, messages[:-1], generation=True)
-    full_ids = _render(tokenizer, messages, generation=False)
-    if full_ids[: len(prompt_ids)] != prompt_ids:
-        raise ValueError("Supplemental prompt is not a prefix of the full example")
-    target_tokens = len(full_ids) - len(prompt_ids)
+    _, full_ids, target_ids = assistant_target_ids(tokenizer, messages)
+    target_tokens = len(target_ids)
     if not 0 < target_tokens <= max_target_tokens:
         raise ValueError("Supplemental target violates the configured token budget")
     if len(full_ids) > max_length:
@@ -58,20 +46,30 @@ def _row(
 
 def _filler_turns(rng: random.Random, count: int) -> list[dict[str, str]]:
     topics = (
-        "notebooks", "coffee", "weather", "keyboards", "music", "trains",
-        "gardening", "photography", "books", "bicycles",
+        "notebooks",
+        "coffee",
+        "weather",
+        "keyboards",
+        "music",
+        "trains",
+        "gardening",
+        "photography",
+        "books",
+        "bicycles",
     )
     turns: list[dict[str, str]] = []
     for filler_index in range(count):
         topic = topics[rng.randrange(len(topics))]
         value = rng.randint(10, 99)
-        turns.extend([
-            {
-                "role": "user",
-                "content": f"Unrelated note {filler_index + 1}: I counted {value} {topic} items.",
-            },
-            {"role": "assistant", "content": "Understood."},
-        ])
+        turns.extend(
+            [
+                {
+                    "role": "user",
+                    "content": f"Unrelated note {filler_index + 1}: I counted {value} {topic} items.",
+                },
+                {"role": "assistant", "content": "Understood."},
+            ]
+        )
     return turns
 
 
@@ -151,14 +149,19 @@ def _reasoning_messages(index: int, rng: random.Random) -> list[dict[str, str]]:
         answer = str(boxes * each - removed)
     elif variant == 2:
         speed, hours = rng.randint(20, 90), rng.randint(2, 8)
-        question, answer = f"A vehicle travels {speed} km per hour for {hours} hours. What distance does it cover?", f"{speed * hours} km"
+        question, answer = (
+            f"A vehicle travels {speed} km per hour for {hours} hours. What distance does it cover?",
+            f"{speed * hours} km",
+        )
     elif variant == 3:
         values = sorted(rng.sample(range(10, 100), 4))
         question = f"Order these numbers from largest to smallest: {', '.join(map(str, values))}."
         answer = ", ".join(map(str, reversed(values)))
     elif variant == 4:
         start, duration = rng.randint(8, 15), rng.randint(2, 6)
-        question = f"A meeting starts at {start}:00 and lasts {duration} hours. At what hour does it end?"
+        question = (
+            f"A meeting starts at {start}:00 and lasts {duration} hours. At what hour does it end?"
+        )
         answer = f"{start + duration}:00"
     elif variant == 5:
         word = f"logic{index}"
@@ -170,9 +173,7 @@ def _reasoning_messages(index: int, rng: random.Random) -> list[dict[str, str]]:
         answer = str(start + step * 4)
     else:
         red, blue = rng.randint(2, 12), rng.randint(2, 12)
-        question = (
-            f"A bag contains {red} red and {blue} blue tokens. How many tokens are in the bag altogether?"
-        )
+        question = f"A bag contains {red} red and {blue} blue tokens. How many tokens are in the bag altogether?"
         answer = str(red + blue)
     return [system, {"role": "user", "content": question}, {"role": "assistant", "content": answer}]
 
@@ -199,13 +200,15 @@ def build_supplemental_examples(
             if category == "context_retention"
             else _reasoning_messages(index, rng)
         )
-        rows.append(_row(
-            tokenizer,
-            split,
-            category,
-            local_index,
-            messages,
-            max_length,
-            max_target_tokens,
-        ))
+        rows.append(
+            _row(
+                tokenizer,
+                split,
+                category,
+                local_index,
+                messages,
+                max_length,
+                max_target_tokens,
+            )
+        )
     return rows

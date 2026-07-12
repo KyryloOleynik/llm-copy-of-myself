@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import random
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -10,9 +8,15 @@ from statistics import median
 from typing import Any, Iterable
 
 from personal_ai.config import AppConfig
-from personal_ai.prompts import relationship_system_message
 from personal_ai.supplemental import build_supplemental_examples
-from personal_ai.tokenization import token_ids
+from personal_ai.utils import (
+    assistant_target_ids,
+    read_json,
+    relationship_system_message,
+    sha256_file,
+    write_json,
+    write_jsonl,
+)
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -82,7 +86,7 @@ def merge_turns(messages: Iterable[dict[str, Any]], owner_id: str) -> list[dict[
     return turns
 
 
-def split_sessions(
+def split_dataset_sessions(
     sessions: list[dict[str, Any]],
     train_ratio: float = 0.8,
     validation_ratio: float = 0.1,
@@ -114,17 +118,6 @@ def split_sessions(
     }
 
 
-def _render_ids(tokenizer: Any, messages: list[dict[str, str]], generation: bool) -> list[int]:
-    return token_ids(
-        tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=generation,
-            enable_thinking=False,
-        )
-    )
-
-
 def _fit_example(
     tokenizer: Any,
     system: dict[str, str],
@@ -134,8 +127,6 @@ def _fit_example(
     max_target_tokens: int,
 ) -> tuple[list[dict[str, str]], int, int] | None:
     context = list(context)
-    while context and context[0]["role"] == "assistant":
-        context.pop(0)
     # Avoid rendering an arbitrarily long Telegram session only to discard its
     # oldest turns. This conservative content-only estimate bounds the first
     # real chat-template render; the exact loop below remains authoritative.
@@ -145,35 +136,24 @@ def _fit_example(
     approximate_tokens = 0
     start = len(context)
     for candidate_index in range(len(context) - 1, -1, -1):
-        turn_tokens = len(
-            tokenizer.encode(context[candidate_index]["content"], add_special_tokens=False)
-        ) + 4
+        turn_tokens = (
+            len(tokenizer.encode(context[candidate_index]["content"], add_special_tokens=False)) + 4
+        )
         if approximate_tokens and approximate_tokens + turn_tokens > approximate_budget:
             break
         approximate_tokens += turn_tokens
         start = candidate_index
     context = context[start:]
-    while context and context[0]["role"] == "assistant":
-        context.pop(0)
     while context and any(turn["role"] == "user" for turn in context):
-        prompt = [system] + [
-            {"role": turn["role"], "content": turn["content"]} for turn in context
-        ]
+        prompt = [system] + [{"role": turn["role"], "content": turn["content"]} for turn in context]
         messages = prompt + [{"role": "assistant", "content": target["content"]}]
-        prompt_ids = _render_ids(tokenizer, prompt, generation=True)
-        full_ids = _render_ids(tokenizer, messages, generation=False)
-        if full_ids[: len(prompt_ids)] != prompt_ids:
-            raise ValueError("Prompt is not a prefix of the complete chat template")
-        target_count = len(full_ids) - len(prompt_ids)
-        if target_count <= 0:
-            raise ValueError("Chat template produced an empty assistant target")
+        _, full_ids, target_ids = assistant_target_ids(tokenizer, messages)
+        target_count = len(target_ids)
         if target_count > max_target_tokens:
             return None
         if len(full_ids) <= max_length:
             return messages, len(full_ids), target_count
         context.pop(0)
-        while context and context[0]["role"] == "assistant":
-            context.pop(0)
     return None
 
 
@@ -193,8 +173,6 @@ def _build_session_examples(
         if target["role"] != "assistant" or index == 0:
             continue
         context = turns[:index]
-        while context and context[0]["role"] == "assistant":
-            context = context[1:]
         if not context or not any(turn["role"] == "user" for turn in context):
             exclusions["missing_user_context"] += 1
             continue
@@ -294,14 +272,9 @@ def _percentiles(values: list[int]) -> dict[str, int | float | None]:
     }
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
     """Build deterministic tokenizer-budgeted examples from cleaned sessions."""
-    with config.data.cleaned.open("r", encoding="utf-8") as source_file:
-        cleaned = json.load(source_file)
+    cleaned = read_json(config.data.cleaned)
 
     splits: dict[str, list[dict[str, Any]]] = {"train": [], "validation": [], "test": []}
     split_boundaries: dict[str, dict[str, str | None]] = {}
@@ -311,7 +284,7 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         if chat.get("type") != "personal_chat":
             exclusions["non_personal_chat"] += 1
             continue
-        allocated = split_sessions(
+        allocated = split_dataset_sessions(
             chat.get("sessions", []),
             config.data.train_ratio,
             config.data.validation_ratio,
@@ -339,18 +312,18 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
             ("context_retention", config.data.context_retention_ratio),
             ("general_reasoning", config.data.general_reasoning_ratio),
         ):
-            supplemental_count = round(
-                personal_count * ratio / config.data.personal_data_ratio
+            supplemental_count = round(personal_count * ratio / config.data.personal_data_ratio)
+            splits[split].extend(
+                build_supplemental_examples(
+                    tokenizer=tokenizer,
+                    split=split,
+                    category=category,
+                    count=supplemental_count,
+                    max_length=config.model.sequence_length,
+                    max_target_tokens=config.data.max_target_tokens,
+                    seed=config.training.seed,
+                )
             )
-            splits[split].extend(build_supplemental_examples(
-                tokenizer=tokenizer,
-                split=split,
-                category=category,
-                count=supplemental_count,
-                max_length=config.model.sequence_length,
-                max_target_tokens=config.data.max_target_tokens,
-                seed=config.training.seed,
-            ))
         splits[split].sort(key=lambda row: (row["timestamp"], row["example_id"]))
 
     output = config.data.output_dir
@@ -358,15 +331,11 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
     artifact_paths: dict[str, Path] = {}
     for split, rows in splits.items():
         path = output / f"{split}.jsonl"
-        with path.open("w", encoding="utf-8", newline="\n") as target:
-            for row in rows:
-                target.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        write_jsonl(path, rows)
         artifact_paths[split] = path
 
     combined = [row for split in ("train", "validation", "test") for row in splits[split]]
-    with config.data.dataset.open("w", encoding="utf-8", newline="\n") as target:
-        json.dump(combined, target, ensure_ascii=False, indent=2, sort_keys=True)
-        target.write("\n")
+    write_json(config.data.dataset, combined)
 
     relationship_counts = {
         split: dict(sorted(Counter(row["relationship"] for row in rows).items()))
@@ -376,9 +345,7 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         split: dict(sorted(Counter(row["source_type"] for row in rows).items()))
         for split, rows in splits.items()
     }
-    chat_counts = {
-        split: Counter(row["chat_id"] for row in rows) for split, rows in splits.items()
-    }
+    chat_counts = {split: Counter(row["chat_id"] for row in rows) for split, rows in splits.items()}
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "contains_unredacted_private_data": True,
@@ -391,11 +358,11 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         "max_target_tokens": config.data.max_target_tokens,
         "seed": config.training.seed,
         "raw_source": str(config.data.source),
-        "raw_source_sha256": _sha256(config.data.source),
+        "raw_source_sha256": sha256_file(config.data.source),
         "source": str(config.data.cleaned),
-        "source_sha256": _sha256(config.data.cleaned),
-        "dataset_sha256": _sha256(config.data.dataset),
-        "artifact_sha256": {name: _sha256(path) for name, path in artifact_paths.items()},
+        "source_sha256": sha256_file(config.data.cleaned),
+        "dataset_sha256": sha256_file(config.data.dataset),
+        "artifact_sha256": {name: sha256_file(path) for name, path in artifact_paths.items()},
         "counts": {name: len(rows) for name, rows in splits.items()},
         "exclusions": dict(sorted(exclusions.items())),
         "split_method": "complete sessions, chronological within each chat",
@@ -417,14 +384,10 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         },
         "chat_dominance": {
             name: [
-                {"chat_id": chat_id, "examples": count}
-                for chat_id, count in counts.most_common(10)
+                {"chat_id": chat_id, "examples": count} for chat_id, count in counts.most_common(10)
             ]
             for name, counts in chat_counts.items()
         },
     }
-    (output / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(output / "manifest.json", manifest)
     return manifest

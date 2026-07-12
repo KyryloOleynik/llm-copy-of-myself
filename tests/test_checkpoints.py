@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from personal_ai.modeling import TOKEN_MIXER_SUFFIXES, select_language_lora_modules
 from personal_ai.training import (
     _checkpoint_is_resumable,
     _latest_valid_checkpoint,
@@ -52,14 +53,37 @@ def test_full_training_requires_matching_smoke_gate(tmp_path):
     with pytest.raises(RuntimeError, match="--smoke"):
         require_successful_smoke(config, "dataset-hash")
 
-    (tmp_path / "smoke-test.json").write_text(json.dumps({
-        "model": "Qwen/Qwen3.5-4B",
-        "dataset_sha256": "dataset-hash",
-        "peak_vram_reserved_bytes": 11 * 1024**3,
-    }), encoding="utf-8")
+    (tmp_path / "smoke-test.json").write_text(
+        json.dumps(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "dataset_sha256": "dataset-hash",
+                "peak_vram_reserved_bytes": 11 * 1024**3,
+            }
+        ),
+        encoding="utf-8",
+    )
     assert require_successful_smoke(config, "dataset-hash")["model"] == "Qwen/Qwen3.5-4B"
 
 
 def test_smoke_selection_uses_longest_examples():
     dataset = {"sequence_tokens": [100, 4096, 512, 2048]}
     assert longest_example_indices(dataset, 2) == [1, 3]
+
+
+class WeightedModule:
+    weight = object()
+
+
+class FakeQwenModel:
+    def named_modules(self):
+        for suffix in sorted(TOKEN_MIXER_SUFFIXES):
+            yield f"model.language_model.layers.0.{suffix}", WeightedModule()
+        yield "model.visual.blocks.0.out_proj", WeightedModule()
+
+
+def test_only_language_token_mixers_are_selected():
+    selected = select_language_lora_modules(FakeQwenModel())
+    assert len(selected) == len(TOKEN_MIXER_SUFFIXES)
+    assert all("language_model" in name for name in selected)
+    assert all("visual" not in name for name in selected)

@@ -18,8 +18,8 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
   - 10+ sessions: 80% train, 10% validation, remainder test.
   - 3–9 sessions: all but the newest two train, then one validation and one test.
   - Fewer than 3 sessions: train only.
-- Add the shared relationship system prompt, remove leading assistant turns, and store the
-  session ID plus actual target timestamp.
+- Add the shared relationship system prompt, preserve leading owner/assistant turns when
+  they precede later user context, and store the session ID plus actual target timestamp.
 - Use the Qwen3.5 tokenizer to keep every complete example within 4,096 tokens. Targets
   may use at most 256 tokens; skip only an oversized target and remove oldest complete
   context turns when necessary.
@@ -36,6 +36,11 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 ## Training pipeline
 
 - Use `Qwen/Qwen3.5-4B` in non-thinking mode with the exact pinned Transformers commit.
+- Use QLoRA, not full-precision LoRA: the official `4B` name describes parameter count,
+  while the source checkpoint is BF16. Quantize the frozen source weights to NF4 only when
+  loading them for training, then train the LoRA adapter weights in higher precision. Revisit
+  ordinary LoRA only if a measured 4,096-token smoke run proves the BF16 base fits below the
+  12 GiB limit with sufficient headroom.
 - Load the official multimodal model in NF4 with double quantization and BF16 compute, but
   freeze the vision encoder and select LoRA only on language token mixers:
   `q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `in_proj_a`,
@@ -90,7 +95,8 @@ adapter win totals in `data/processed/style_ratings.json` and rerun evaluation.
 
 - Dataset regeneration is deterministic with seed 42.
 - No session ID exists in more than one split.
-- All examples begin with system then user and end with a non-empty assistant target.
+- All examples begin with system, contain at least one user turn, preserve available leading
+  owner context, and end with a non-empty assistant target.
 - No sequence or target exceeds its configured token budget.
 - No LoRA parameter belongs to the vision encoder.
 - The RTX 5070 smoke run completes below 12 GiB without CPU offload.

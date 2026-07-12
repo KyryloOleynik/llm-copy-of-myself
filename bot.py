@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sqlite3
@@ -20,22 +19,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from personal_ai.prompts import relationship_system_message
-from personal_ai.tokenization import token_ids
+from personal_ai.modeling import generate_reply, load_inference_model
+from personal_ai.utils import load_dotenv, read_json, relationship_system_message, render_chat_ids
 
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
-
-
-def load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line and not line.startswith("#"):
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
 
 
 load_dotenv(ENV_PATH)
@@ -108,10 +97,6 @@ class LocalModel:
     """A base model and trained adapter kept resident for the bot's lifetime."""
 
     def __init__(self, base_model: str, adapter_path: Path) -> None:
-        import torch
-        from peft import PeftModel
-        from transformers import AutoModelForMultimodalLM, AutoTokenizer, BitsAndBytesConfig
-
         if not adapter_path.is_dir():
             raise FileNotFoundError(f"Trained adapter not found: {adapter_path}")
         if not EVALUATION_REPORT.is_file():
@@ -119,7 +104,7 @@ class LocalModel:
                 f"Adapter acceptance report is missing: {EVALUATION_REPORT}. "
                 "Run personal-ai evaluate and complete blind style ratings first."
             )
-        evaluation = json.loads(EVALUATION_REPORT.read_text(encoding="utf-8"))
+        evaluation = read_json(EVALUATION_REPORT)
         result = evaluation.get("results", {}).get(adapter_path.name, {})
         if not result.get("accepted"):
             raise RuntimeError(
@@ -128,37 +113,16 @@ class LocalModel:
             )
 
         logging.info("Loading tokenizer and model into memory from %s", adapter_path)
-        self.torch = torch
-        self.tokenizer = AutoTokenizer.from_pretrained(adapter_path)
-        quantization = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+        self.torch, self.tokenizer, self.model = load_inference_model(
+            base_model, adapter_path, "auto"
         )
-        base = AutoModelForMultimodalLM.from_pretrained(
-            base_model,
-            device_map="auto",
-            quantization_config=quantization,
-            dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-        )
-        self.model = PeftModel.from_pretrained(base, adapter_path)
-        self.model.eval()
         logging.info("Model loaded and ready; it will remain resident until bot.py exits")
 
     def _fit_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
         """Drop oldest complete turns until prompt plus reply reserve fits 8K."""
         fitted = list(messages)
         while True:
-            input_ids = token_ids(
-                self.tokenizer.apply_chat_template(
-                    fitted,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            )
+            input_ids = render_chat_ids(self.tokenizer, fitted, generation=True)
             if len(input_ids) + MAX_NEW_TOKENS <= MAX_CONTEXT_TOKENS:
                 return fitted
             if len(fitted) <= 2:
@@ -169,25 +133,18 @@ class LocalModel:
 
     def generate(self, messages: list[dict[str, str]]) -> str:
         messages = self._fit_messages(messages)
-        prompt = self.tokenizer.apply_chat_template(
+        reply, _ = generate_reply(
+            self.torch,
+            self.tokenizer,
+            self.model,
             messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9,
+            repetition_penalty=1.05,
         )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        with self.torch.inference_mode():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=True,
-                temperature=0.8,
-                top_p=0.9,
-                repetition_penalty=1.05,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        generated = output[0, inputs["input_ids"].shape[1] :]
-        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        return reply
 
 
 @dataclass
