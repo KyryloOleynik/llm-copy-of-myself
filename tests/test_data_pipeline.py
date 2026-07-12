@@ -1,0 +1,164 @@
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+from personal_ai.data import merge_turns, prepare_dataset, split_dataset_sessions
+from personal_ai.supplemental import build_supplemental_examples
+from tests.helpers import FakeTokenizer
+
+
+def _message(message_id, role, text, date, **extra):
+    return {
+        "id": message_id,
+        "from_id": "owner" if role == "assistant" else "other",
+        "text": text,
+        "date": date,
+        **extra,
+    }
+
+
+def _config(tmp_path: Path):
+    return SimpleNamespace(
+        project=SimpleNamespace(owner_from_id="owner"),
+        model=SimpleNamespace(base_model="fake/model", sequence_length=1024),
+        data=SimpleNamespace(
+            source=tmp_path / "raw.json",
+            cleaned=tmp_path / "cleaned.json",
+            dataset=tmp_path / "dataset.json",
+            output_dir=tmp_path / "processed",
+            train_ratio=0.8,
+            validation_ratio=0.1,
+            max_target_tokens=256,
+            max_examples_per_chat=1000,
+            max_identical_short_target=25,
+            short_target_max_tokens=3,
+            personal_data_ratio=1.0,
+            context_retention_ratio=0.0,
+            general_reasoning_ratio=0.0,
+        ),
+        training=SimpleNamespace(seed=42),
+    )
+
+
+def test_long_assistant_message_does_not_drop_session():
+    turns = merge_turns(
+        [
+            _message(1, "user", "hello", "2026-01-01T00:00:00"),
+            _message(2, "assistant", "x" * 1000, "2026-01-01T00:01:00"),
+            _message(3, "user", "next", "2026-01-01T00:02:00"),
+        ],
+        "owner",
+    )
+    assert len(turns) == 3
+    assert len(turns[1]["content"]) == 1000
+
+
+def test_media_is_preserved_and_marked_media_only():
+    turns = merge_turns(
+        [
+            _message(1, "user", "", "2026-01-01T00:00:00", photo="photo.jpg"),
+        ],
+        "owner",
+    )
+    assert turns[0]["content"] == "[sent image]"
+    assert turns[0]["media_only"] is True
+
+
+def test_session_split_rules():
+    sessions = [
+        {"session_id": f"s{i:02d}", "messages": [{"date": f"2026-01-{i + 1:02d}"}]}
+        for i in range(12)
+    ]
+    splits = split_dataset_sessions(sessions)
+    assert [len(splits[name]) for name in ("train", "validation", "test")] == [9, 1, 2]
+    assert not (
+        set(s["session_id"] for s in splits["train"]) & set(s["session_id"] for s in splits["test"])
+    )
+
+
+def test_prepare_dataset_is_deterministic_and_session_isolated(tmp_path):
+    config = _config(tmp_path)
+    sessions = []
+    for index in range(12):
+        date = f"2026-01-{index + 1:02d}T00:00:00"
+        messages = [
+            _message(index * 3 + 1, "user", f"question {index}", date),
+            _message(index * 3 + 2, "assistant", f"answer {index}", date),
+        ]
+        if index == 0:
+            messages.insert(
+                0,
+                _message(index * 3, "assistant", "meaningful opening owner context", date),
+            )
+        sessions.append(
+            {
+                "session_id": f"session-{index:02d}",
+                "messages": messages,
+            }
+        )
+    cleaned = {
+        "chats": [
+            {"id": 1, "type": "personal_chat", "relationship": "family", "sessions": sessions},
+            {"id": 2, "type": "private_group", "relationship": "friend", "sessions": sessions},
+        ]
+    }
+    config.data.cleaned.write_text(json.dumps(cleaned), encoding="utf-8")
+    config.data.source.write_text(json.dumps(cleaned), encoding="utf-8")
+    manifest = prepare_dataset(config, FakeTokenizer())
+    first_bytes = config.data.dataset.read_bytes()
+    second_manifest = prepare_dataset(config, FakeTokenizer())
+    assert config.data.dataset.read_bytes() == first_bytes
+    assert (
+        manifest["counts"]
+        == second_manifest["counts"]
+        == {
+            "train": 9,
+            "validation": 1,
+            "test": 2,
+        }
+    )
+    assert manifest["exclusions"]["non_personal_chat"] == 1
+    seen = {}
+    for split in ("train", "validation", "test"):
+        for line in (config.data.output_dir / f"{split}.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            assert row["messages"][0]["role"] == "system"
+            assert any(message["role"] == "user" for message in row["messages"][1:-1])
+            assert row["messages"][-1]["role"] == "assistant"
+            assert row["timestamp"].startswith("2026-01-")
+            assert row["session_id"] not in seen
+            seen[row["session_id"]] = split
+    leading = next(
+        row
+        for line in (config.data.output_dir / "train.jsonl").read_text().splitlines()
+        if (row := json.loads(line))["session_id"] == "session-00"
+    )
+    assert leading["messages"][1] == {
+        "role": "assistant",
+        "content": "meaningful opening owner context",
+    }
+
+
+def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
+    tokenizer = FakeTokenizer()
+    kwargs = {
+        "tokenizer": tokenizer,
+        "count": 10,
+        "max_length": 4096,
+        "max_target_tokens": 256,
+        "seed": 42,
+    }
+    context_train = build_supplemental_examples(
+        split="train", category="context_retention", **kwargs
+    )
+    context_test = build_supplemental_examples(split="test", category="context_retention", **kwargs)
+    reasoning = build_supplemental_examples(split="train", category="general_reasoning", **kwargs)
+    assert context_train == build_supplemental_examples(
+        split="train", category="context_retention", **kwargs
+    )
+    assert {row["example_id"] for row in context_train}.isdisjoint(
+        row["example_id"] for row in context_test
+    )
+    assert all(row["source_type"] == "context_retention" for row in context_train)
+    assert all(row["source_type"] == "general_reasoning" for row in reasoning)
+    assert all(row["messages"][-1]["role"] == "assistant" for row in context_train + reasoning)
