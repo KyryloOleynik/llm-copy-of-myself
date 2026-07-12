@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Local dataset, QLoRA training, evaluation, retrieval, and bot pipeline"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "Jinja2>=3.1,<4",
   "PyYAML>=6.0,<7",
   "pydantic>=2.10,<3",
   "typer>=0.15,<1",
@@ -21,7 +22,7 @@ train = [
   "numpy>=1.26,<3",
   "peft>=0.14,<1",
   "safetensors>=0.5,<1",
-  "transformers>=4.51,<5",
+  "transformers @ git+https://github.com/huggingface/transformers.git@4626421dc6b741a329300682a6408246ee465490",
   "trl>=0.15,<1",
 ]
 bot = [
@@ -29,7 +30,7 @@ bot = [
   "accelerate>=1.2,<2",
   "bitsandbytes>=0.45,<1",
   "peft>=0.14,<1",
-  "transformers>=4.51,<5",
+  "transformers @ git+https://github.com/huggingface/transformers.git@4626421dc6b741a329300682a6408246ee465490",
 ]
 dev = ["pytest>=8.3,<9", "ruff>=0.9,<1"]
 

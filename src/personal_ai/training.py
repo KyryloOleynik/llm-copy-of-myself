@@ -1,23 +1,24 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import platform
 import re
 import shutil
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from personal_ai.config import AppConfig
+from personal_ai.tokenization import token_ids
 
 
 IGNORE_INDEX = -100
-TARGET_MODULES = [
+TOKEN_MIXER_SUFFIXES = {
     "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
-]
+    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
+}
 
 
 def _checkpoint_is_resumable(path: Path) -> bool:
@@ -76,66 +77,14 @@ def _save_interrupted_checkpoint(trainer: Any, tokenizer: Any, output_dir: Path)
     return final_checkpoint
 
 
-def _read_json(path: Path) -> list[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as source:
-        value = json.load(source)
-    if not isinstance(value, list):
-        raise ValueError(f"Expected a JSON list in {path}")
-    return value
-
-
-def prepare_existing_dataset(config: AppConfig) -> dict[str, Any]:
-    """Chronologically split examples per chat and write JSONL plus a manifest."""
-    source = config.data.dataset
-    examples = _read_json(source)
-    by_chat: dict[str, list[dict[str, Any]]] = {}
-    for example in examples:
-        by_chat.setdefault(example["chat_id"], []).append(example)
-
-    splits = {"train": [], "test": []}
-    split_boundaries: dict[str, dict[str, str | None]] = {}
-    for chat_id, rows in by_chat.items():
-        rows.sort(key=lambda row: (row["timestamp"], row["example_id"]))
-        count = len(rows)
-        train_end = max(1, int(count * config.data.train_ratio))
-        for index, row in enumerate(rows):
-            split = "train" if index < train_end else "test"
-            splits[split].append(row)
-        split_boundaries[chat_id] = {
-            "train_end": rows[train_end - 1]["timestamp"] if train_end else None,
-        }
-
-    output = config.data.output_dir
-    output.mkdir(parents=True, exist_ok=True)
-    for name, rows in splits.items():
-        with (output / f"{name}.jsonl").open("w", encoding="utf-8") as target:
-            for row in rows:
-                target.write(json.dumps(row, ensure_ascii=False) + "\n")
-    validation_path = output / "validation.jsonl"
-    if validation_path.exists():
-        validation_path.unlink()
-
-    digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    manifest = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source": str(source),
-        "source_sha256": digest,
-        "redaction_version": "not-yet-implemented",
-        "counts": {name: len(rows) for name, rows in splits.items()},
-        "split_method": "chronological within chat",
-        "split_boundaries": split_boundaries,
-        "warning": "Existing dataset is not yet fully sanitized or deduplicated; review before real training.",
-    }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return manifest
-
-
 @dataclass
 class ReplyOnlyCollator:
     """Tokenize chat examples and compute loss only on the final assistant reply."""
 
     tokenizer: Any
     max_length: int
+    max_target_tokens: int = 256
+    audit: Counter[str] = field(default_factory=Counter)
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         import torch
@@ -153,9 +102,29 @@ class ReplyOnlyCollator:
                 messages, tokenize=True, add_generation_prompt=False,
                 enable_thinking=False,
             )
-            full_ids = full_ids[: self.max_length]
-            prompt_length = min(len(prompt_ids), len(full_ids))
-            labels = [IGNORE_INDEX] * prompt_length + full_ids[prompt_length:]
+            prompt_ids = token_ids(prompt_ids)
+            full_ids = token_ids(full_ids)
+            if full_ids[: len(prompt_ids)] != prompt_ids:
+                self.audit["prompt_prefix_mismatch"] += 1
+                raise ValueError("Prompt is not a prefix of the complete example")
+            target_ids = full_ids[len(prompt_ids):]
+            if not target_ids:
+                self.audit["zero_label_example"] += 1
+                raise ValueError("Example has no trainable assistant target tokens")
+            if len(target_ids) > self.max_target_tokens:
+                self.audit["oversized_target"] += 1
+                raise ValueError(
+                    f"Assistant target has {len(target_ids)} tokens; "
+                    f"maximum is {self.max_target_tokens}"
+                )
+            if len(full_ids) > self.max_length:
+                self.audit["sequence_overflow"] += 1
+                raise ValueError(
+                    f"Prepared example has {len(full_ids)} tokens; maximum is {self.max_length}"
+                )
+            labels = [IGNORE_INDEX] * len(prompt_ids) + target_ids
+            self.audit["examples"] += 1
+            self.audit["target_tokens"] += len(target_ids)
             encoded_examples.append({"input_ids": full_ids, "labels": labels})
 
         max_len = max(len(row["input_ids"]) for row in encoded_examples)
@@ -173,6 +142,80 @@ class ReplyOnlyCollator:
         }
 
 
+def select_language_lora_modules(model: Any) -> list[str]:
+    """Select exact Qwen3.5 language token-mixer paths, never vision modules."""
+    selected: list[str] = []
+    observed: Counter[str] = Counter()
+    for name, module in model.named_modules():
+        suffix = name.rsplit(".", 1)[-1]
+        if suffix not in TOKEN_MIXER_SUFFIXES or not hasattr(module, "weight"):
+            continue
+        lowered = name.casefold()
+        if "vision" in lowered or "visual" in lowered:
+            continue
+        if "language_model" not in lowered:
+            continue
+        selected.append(name)
+        observed[suffix] += 1
+    missing = sorted(TOKEN_MIXER_SUFFIXES - set(observed))
+    if missing:
+        raise RuntimeError(f"Qwen3.5 language projections are missing: {missing}")
+    if not selected:
+        raise RuntimeError("No Qwen3.5 language-model LoRA modules were selected")
+    if any("vision" in name.casefold() or "visual" in name.casefold() for name in selected):
+        raise RuntimeError("A vision module was selected for LoRA")
+    return selected
+
+
+def validate_prepared_dataset(config: AppConfig) -> dict[str, Any]:
+    """Fail before training when dataset invariants or privacy acknowledgement drift."""
+    manifest_path = config.data.output_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("Prepared manifest is missing; run personal-ai prepare-data")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("model") != config.model.base_model:
+        raise RuntimeError("Prepared dataset tokenizer model differs from training model")
+    if manifest.get("sequence_length") != config.model.sequence_length:
+        raise RuntimeError("Prepared dataset sequence length differs from training configuration")
+    if not manifest.get("contains_unredacted_private_data"):
+        raise RuntimeError("Unredacted private-data acknowledgement is missing")
+    session_splits: dict[str, str] = {}
+    for split in ("train", "validation", "test"):
+        path = config.data.output_dir / f"{split}.jsonl"
+        if not path.is_file():
+            raise RuntimeError(f"Prepared split is missing: {path}")
+        with path.open("r", encoding="utf-8") as source:
+            for line_number, line in enumerate(source, 1):
+                row = json.loads(line)
+                if row.get("split") != split:
+                    raise ValueError(f"{path}:{line_number} has the wrong split")
+                session_id = row["session_id"]
+                previous = session_splits.setdefault(session_id, split)
+                if previous != split:
+                    raise ValueError(f"Session {session_id} crosses {previous}/{split}")
+                if row["sequence_tokens"] > config.model.sequence_length:
+                    raise ValueError(f"{row['example_id']} exceeds the sequence limit")
+                if not 0 < row["target_tokens"] <= config.data.max_target_tokens:
+                    raise ValueError(f"{row['example_id']} has invalid target length")
+    return manifest
+
+
+def require_successful_smoke(config: AppConfig, dataset_sha256: str) -> dict[str, Any]:
+    """Block a full run until the same model/dataset passed the RTX VRAM smoke gate."""
+    path = config.training.output_dir / "smoke-test.json"
+    if not path.is_file():
+        raise RuntimeError("Run personal-ai train --smoke --fresh before full training")
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    if metadata.get("model") != config.model.base_model:
+        raise RuntimeError("Smoke test used a different base model")
+    if metadata.get("dataset_sha256") != dataset_sha256:
+        raise RuntimeError("Smoke test used a different prepared dataset")
+    peak = metadata.get("peak_vram_reserved_bytes")
+    if peak is None or peak >= 12 * 1024**3:
+        raise RuntimeError("Smoke test did not verify peak reserved VRAM below 12 GiB")
+    return metadata
+
+
 def train(
     config: AppConfig,
     smoke: bool = False,
@@ -184,7 +227,7 @@ def train(
         from datasets import load_dataset
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
         from transformers import (
-            AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+            AutoModelForMultimodalLM, AutoTokenizer, BitsAndBytesConfig,
             Trainer, TrainingArguments, set_seed,
         )
     except ImportError as exc:
@@ -195,8 +238,12 @@ def train(
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError("This configuration requires a CUDA GPU with BF16 support.")
 
+    manifest = validate_prepared_dataset(config)
+    experiment_dir = config.training.output_dir
+    if not smoke:
+        require_successful_smoke(config, manifest["dataset_sha256"])
     set_seed(config.training.seed)
-    output_dir = config.training.output_dir
+    output_dir = experiment_dir / "smoke" if smoke else experiment_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     if fresh and resume is not None:
         raise ValueError("Use either --fresh or --resume, not both")
@@ -210,10 +257,16 @@ def train(
         resume = last_checkpoint
         if resume is not None:
             print(f"Automatically resuming from {resume}")
-    data_files = {"train": str(config.data.output_dir / "train.jsonl")}
+    data_files = {
+        "train": str(config.data.output_dir / "train.jsonl"),
+        "validation": str(config.data.output_dir / "validation.jsonl"),
+    }
     dataset = load_dataset("json", data_files=data_files)
     if smoke:
         dataset["train"] = dataset["train"].select(range(min(20, len(dataset["train"]))))
+        dataset["validation"] = dataset["validation"].select(
+            range(min(20, len(dataset["validation"])))
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(config.model.base_model, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -224,38 +277,53 @@ def train(
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForMultimodalLM.from_pretrained(
         config.model.base_model,
         quantization_config=quantization,
         dtype=torch.bfloat16,
         device_map={"": 0},
-        attn_implementation="sdpa",
     )
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=config.training.gradient_checkpointing
     )
+    target_modules = select_language_lora_modules(model)
     model = get_peft_model(model, LoraConfig(
         r=config.training.lora_rank,
         lora_alpha=config.training.lora_alpha,
         lora_dropout=config.training.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=TARGET_MODULES,
+        target_modules=target_modules,
     ))
 
+    trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not trainable_names or any(
+        "vision" in name.casefold() or "visual" in name.casefold() for name in trainable_names
+    ):
+        raise RuntimeError("LoRA trainable parameters are empty or include the vision encoder")
+
+    interval = 1 if smoke else config.training.eval_steps
+    save_interval = 1 if smoke else config.training.save_steps
     args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=config.training.micro_batch_size,
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         learning_rate=config.training.learning_rate,
         num_train_epochs=config.training.epochs,
+        max_steps=1 if smoke else -1,
+        warmup_ratio=config.training.warmup_ratio,
+        lr_scheduler_type=config.training.lr_scheduler_type,
         bf16=True,
         tf32=True,
         gradient_checkpointing=config.training.gradient_checkpointing,
         logging_steps=config.training.logging_steps,
-        save_steps=config.training.save_steps,
-        eval_strategy="no",
+        save_steps=save_interval,
+        eval_strategy="steps",
+        eval_steps=interval,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         save_total_limit=2,
         optim="paged_adamw_8bit",
         report_to="none",
@@ -267,7 +335,10 @@ def train(
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        data_collator=ReplyOnlyCollator(tokenizer, config.model.sequence_length),
+        eval_dataset=dataset["validation"],
+        data_collator=ReplyOnlyCollator(
+            tokenizer, config.model.sequence_length, config.data.max_target_tokens
+        ),
     )
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -277,9 +348,14 @@ def train(
         "gpu": torch.cuda.get_device_name(0),
         "smoke": smoke,
         "seed": config.training.seed,
+        "model": config.model.base_model,
+        "dataset_sha256": manifest["dataset_sha256"],
+        "lora_target_modules": target_modules,
+        "trainable_parameter_names": trainable_names,
     }
     (output_dir / "reproducibility.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     try:
+        torch.cuda.reset_peak_memory_stats()
         trainer.train(resume_from_checkpoint=resume or None)
     except KeyboardInterrupt:
         # A normal Trainer save includes the adapter, optimizer, scheduler, RNG,
@@ -293,5 +369,14 @@ def train(
             "Resume with: personal-ai train --resume last"
         )
         return
+    metadata["peak_vram_allocated_bytes"] = torch.cuda.max_memory_allocated()
+    metadata["peak_vram_reserved_bytes"] = torch.cuda.max_memory_reserved()
+    (output_dir / "reproducibility.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
+    if smoke:
+        (experiment_dir / "smoke-test.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
     trainer.save_model(str(output_dir / "adapter-final"))
     tokenizer.save_pretrained(str(output_dir / "adapter-final"))

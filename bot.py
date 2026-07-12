@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -19,6 +20,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from personal_ai.prompts import relationship_system_message
+from personal_ai.tokenization import token_ids
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,22 +41,25 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(ENV_PATH)
 
 TOKEN = os.getenv("BOT_TOKEN")
-BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen3-8B")
+BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen3.5-4B")
 ADAPTER_PATH = Path(
-    os.getenv("ADAPTER_PATH", str(ROOT / "artifacts/training/qwen3-8b-r16/adapter-final"))
+    os.getenv("ADAPTER_PATH", str(ROOT / "artifacts/training/qwen3.5-4b-r8/adapter-final"))
 )
 MIN_REPLY_DELAY = float(os.getenv("MIN_REPLY_DELAY", "2"))
 MAX_REPLY_DELAY = float(os.getenv("MAX_REPLY_DELAY", "60"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
 STATE_DATABASE = Path(os.getenv("STATE_DATABASE", str(ROOT / "data/bot.sqlite3")))
+EVALUATION_REPORT = Path(
+    os.getenv("EVALUATION_REPORT", str(ROOT / "data/processed/evaluation/evaluation.json"))
+)
 RELATIONSHIPS = {
     "close_friend": "Close friend",
     "friend": "Friend",
     "acquaintance": "Acquaintance",
     "professional_contact": "Professional contact",
-    "mother": "Mother",
-    "father": "Father",
+    "family": "Family",
     "school_acquaintance": "School acquaintance",
 }
 
@@ -104,10 +110,22 @@ class LocalModel:
     def __init__(self, base_model: str, adapter_path: Path) -> None:
         import torch
         from peft import PeftModel
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoModelForMultimodalLM, AutoTokenizer, BitsAndBytesConfig
 
         if not adapter_path.is_dir():
             raise FileNotFoundError(f"Trained adapter not found: {adapter_path}")
+        if not EVALUATION_REPORT.is_file():
+            raise RuntimeError(
+                f"Adapter acceptance report is missing: {EVALUATION_REPORT}. "
+                "Run personal-ai evaluate and complete blind style ratings first."
+            )
+        evaluation = json.loads(EVALUATION_REPORT.read_text(encoding="utf-8"))
+        result = evaluation.get("results", {}).get(adapter_path.name, {})
+        if not result.get("accepted"):
+            raise RuntimeError(
+                f"Adapter {adapter_path.name} has not passed the evaluation gate: "
+                f"{result.get('acceptance_reasons', ['candidate not found'])}"
+            )
 
         logging.info("Loading tokenizer and model into memory from %s", adapter_path)
         self.torch = torch
@@ -118,18 +136,39 @@ class LocalModel:
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-        base = AutoModelForCausalLM.from_pretrained(
+        base = AutoModelForMultimodalLM.from_pretrained(
             base_model,
             device_map="auto",
             quantization_config=quantization,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
         )
         self.model = PeftModel.from_pretrained(base, adapter_path)
         self.model.eval()
         logging.info("Model loaded and ready; it will remain resident until bot.py exits")
 
+    def _fit_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Drop oldest complete turns until prompt plus reply reserve fits 8K."""
+        fitted = list(messages)
+        while True:
+            input_ids = token_ids(
+                self.tokenizer.apply_chat_template(
+                    fitted,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            )
+            if len(input_ids) + MAX_NEW_TOKENS <= MAX_CONTEXT_TOKENS:
+                return fitted
+            if len(fitted) <= 2:
+                raise ValueError("System prompt and latest user message exceed context budget")
+            fitted.pop(1)
+            if len(fitted) > 2 and fitted[1]["role"] == "assistant":
+                fitted.pop(1)
+
     def generate(self, messages: list[dict[str, str]]) -> str:
+        messages = self._fit_messages(messages)
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -185,12 +224,7 @@ async def generation_worker() -> None:
             prompt = [
                 {
                     "role": "system",
-                    "content": (
-                        "You are an AI representation of Rodion. Respond in Rodion's learned "
-                        "communication style. The user's relationship to Rodion is "
-                        f"{RELATIONSHIPS[request.relationship]}. Adjust familiarity, tone, and "
-                        "boundaries appropriately."
-                    ),
+                    "content": relationship_system_message(request.relationship),
                 },
                 *history[-MAX_HISTORY_TURNS * 2 :],
             ]

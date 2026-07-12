@@ -9,10 +9,14 @@ app = typer.Typer(no_args_is_help=True, help="Personal Telegram AI pipeline.")
 
 @app.command("prepare-data")
 def prepare_data(config: Path = Path("config.yaml")) -> None:
-    """Split the existing dataset and create its manifest (transitional v1 step)."""
-    from personal_ai.training import prepare_existing_dataset
+    """Build tokenizer-budgeted train/validation/test data from complete sessions."""
+    from transformers import AutoTokenizer
 
-    manifest = prepare_existing_dataset(load_config(config))
+    from personal_ai.data import prepare_dataset
+
+    app_config = load_config(config)
+    tokenizer = AutoTokenizer.from_pretrained(app_config.model.base_model, use_fast=True)
+    manifest = prepare_dataset(app_config, tokenizer)
     typer.echo(f"Prepared dataset: {manifest['counts']}")
 
 
@@ -36,14 +40,17 @@ def _not_implemented(stage: str) -> None:
 
 @app.command("build-index")
 def build_index() -> None:
-    """Build the sanitized SQLite/NumPy retrieval index (future stage)."""
+    """Build the private SQLite/NumPy retrieval index (deferred stage)."""
     _not_implemented("build-index")
 
 
 @app.command()
-def evaluate() -> None:
-    """Run style, appropriateness, and privacy evaluation (future stage)."""
-    _not_implemented("evaluate")
+def evaluate(config: Path = Path("config.yaml")) -> None:
+    """Compare the base model and available adapters and write evaluation JSON."""
+    from personal_ai.evaluation import evaluate_checkpoints
+
+    report = evaluate_checkpoints(load_config(config))
+    typer.echo(f"Evaluation written to {report}")
 
 
 @app.command("export-model")
