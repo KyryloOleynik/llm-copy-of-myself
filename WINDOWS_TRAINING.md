@@ -30,11 +30,46 @@ Run the full initial experiment:
 personal-ai train
 ```
 
+This automatically resumes the newest checkpoint in the configured training
+directory when one exists. To deliberately ignore existing checkpoints and
+start a new adapter from the base model, use:
+
+```powershell
+personal-ai train --fresh
+```
+
 Resume a checkpoint explicitly:
 
 ```powershell
 personal-ai train --resume artifacts/training/qwen3-8b-r16/checkpoint-100
 ```
+
+Or automatically resume the newest checkpoint:
+
+```powershell
+personal-ai train --resume last
+```
+
+The default configuration saves every 10 optimizer steps and keeps the newest
+two periodic checkpoints. With 16 gradient-accumulation micro-batches, that is
+one checkpoint every 160 micro-batches. Pressing Ctrl+C also writes a resumable
+checkpoint before exiting; wait for the "Interrupted safely" message before
+closing the terminal. The interrupt checkpoint is first written to a staging
+directory and verified (adapter weights, trainer state, optimizer, and
+scheduler) before it is promoted to `checkpoint-N`, so a partial save will not
+be selected for automatic resume.
+
+To discard all trained adapters and checkpoints while retaining the downloaded
+base `Qwen/Qwen3-8B` model in the Hugging Face cache, run from the repository
+root:
+
+```powershell
+Remove-Item -LiteralPath .\artifacts\training\qwen3-8b-r16 -Recurse -Force
+```
+
+After deleting the directory, the next `personal-ai train` starts a fresh
+adapter from the base model. You can also use `--fresh` without deleting old
+checkpoints, although using a separate output directory avoids mixing runs.
 
 The trainer refuses to run without CUDA or BF16 support. It uses 4-bit NF4,
 double quantization, BF16 compute, the LoRA modules and hyperparameters from
@@ -43,7 +78,8 @@ with `nvidia-smi`; the 12 GB acceptance limit must be verified on the target PC.
 
 ## Important data gate
 
-`prepare-data` currently splits the existing `dataset.json` so the training
+`prepare-data` currently splits the existing `dataset.json` into chronological
+train and test sets so the training
 path can be tested. That file has not yet passed the plan's full redaction,
 deduplication, and audit requirements. Do not perform a real personal-data
 training run until those stages are implemented and manually reviewed.

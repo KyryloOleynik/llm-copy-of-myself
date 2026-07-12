@@ -31,7 +31,7 @@ The bot will:
 - Replace direct identities with stable pseudonymous chat IDs and manually reviewed relationship tags such as `close_friend`, `friend`, `family`, `professional`, and `acquaintance`.
 - Redact secrets, authentication codes, payment data, addresses, private links, phone numbers, and third-party sensitive data. Retain non-secret personal facts about you because the selected product intentionally learns facts from conversations.
 - Create assistant-only-loss chat examples using recent turns plus relationship metadata, with your next turn as the sole completion.
-- Split chronologically within each conversation: oldest 80% training, next 10% validation, newest 10% test. Deduplicate before splitting.
+- Split chronologically within each conversation: oldest 90% training and newest 10% test. Deduplicate before splitting.
 - Build a local retrieval index from sanitized historical turns:
   - Store text, chat pseudonym, relationship tag, timestamp, and source message IDs in SQLite.
   - Generate multilingual embeddings locally and store vectors for NumPy cosine search, avoiding a Windows-specific vector database dependency.
@@ -103,7 +103,7 @@ The bot will:
 ## Interfaces and Commands
 
 - CLI commands:
-  - `prepare-data` — build sanitized train/validation/test files and audit reports.
+  - `prepare-data` — build sanitized train/test files and audit reports.
   - `build-index` — create the local historical retrieval index.
   - `train` — run QLoRA and resume checkpoints.
   - `evaluate` — run blind comparison and privacy suites.

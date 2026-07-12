@@ -8,13 +8,12 @@ data:
   dataset: DataExport_2026-07-10/dataset.json
   output_dir: data/processed
   session_gap_hours: 12
-  train_ratio: 0.8
-  validation_ratio: 0.1
+  train_ratio: 0.9
   test_ratio: 0.1
 
 model:
   base_model: Qwen/Qwen3-8B
-  sequence_length: 1024
+  sequence_length: 512
   thinking_enabled: false
 
 training:
@@ -28,7 +27,8 @@ training:
   epochs: 1
   gradient_checkpointing: true
   logging_steps: 5
-  save_steps: 100
+  # Optimizer steps (each is 16 micro-batches with the settings above).
+  save_steps: 10
   seed: 42
 
 retrieval:

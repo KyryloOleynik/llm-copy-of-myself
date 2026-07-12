@@ -6,6 +6,7 @@ __pycache__/
 .idea/
 .agents/
 .env
+data/bot.sqlite3
 data/processed/
 artifacts/
 *.egg-info/

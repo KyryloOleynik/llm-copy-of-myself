@@ -21,11 +21,12 @@ def train(
     config: Path = Path("config.yaml"),
     smoke: bool = typer.Option(False, help="Use at most 20 train/eval examples."),
     resume: str | None = typer.Option(None, help="Checkpoint path, or 'last'."),
+    fresh: bool = typer.Option(False, help="Ignore existing checkpoints and start from the base model."),
 ) -> None:
-    """Train the reply-only QLoRA adapter on a CUDA GPU."""
+    """Train the QLoRA adapter, automatically resuming the latest checkpoint."""
     from personal_ai.training import train as run_training
 
-    run_training(load_config(config), smoke=smoke, resume=resume)
+    run_training(load_config(config), smoke=smoke, resume=resume, fresh=fresh)
 
 
 def _not_implemented(stage: str) -> None:
