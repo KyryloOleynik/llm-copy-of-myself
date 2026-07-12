@@ -47,6 +47,9 @@ def _config(tmp_path: Path):
             max_examples_per_chat=1000,
             max_identical_short_target=25,
             short_target_max_tokens=3,
+            personal_data_ratio=1.0,
+            context_retention_ratio=0.0,
+            general_reasoning_ratio=0.0,
         ),
         training=SimpleNamespace(seed=42),
     )

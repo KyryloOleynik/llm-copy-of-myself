@@ -16,6 +16,9 @@ data:
   max_identical_short_target: 25
   short_target_max_tokens: 3
   contains_unredacted_private_data: true
+  personal_data_ratio: 0.70
+  context_retention_ratio: 0.15
+  general_reasoning_ratio: 0.15
 
 model:
   base_model: Qwen/Qwen3.5-4B
@@ -23,9 +26,9 @@ model:
   thinking_enabled: false
 
 training:
-  output_dir: artifacts/training/qwen3.5-4b-r8
-  lora_rank: 8
-  lora_alpha: 16
+  output_dir: artifacts/training/qwen3.5-4b-r16
+  lora_rank: 16
+  lora_alpha: 32
   lora_dropout: 0.05
   learning_rate: 0.00003
   micro_batch_size: 1

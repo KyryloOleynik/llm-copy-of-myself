@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from personal_ai.config import AppConfig
 from personal_ai.prompts import relationship_system_message
+from personal_ai.supplemental import build_supplemental_examples
 from personal_ai.tokenization import token_ids
 
 
@@ -218,6 +219,7 @@ def _build_session_examples(
                 "chat_id": f"chat_{chat['id']}",
                 "session_id": session["session_id"],
                 "relationship": relationship,
+                "source_type": "personal_telegram",
                 "split": split,
                 "timestamp": target["last_message_date"],
                 "target_message_ids": target["source_message_ids"],
@@ -332,6 +334,24 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
     for split in splits:
         splits[split], balancing = _balance_split(splits[split], tokenizer, config, split)
         exclusions.update(balancing)
+        personal_count = len(splits[split])
+        for category, ratio in (
+            ("context_retention", config.data.context_retention_ratio),
+            ("general_reasoning", config.data.general_reasoning_ratio),
+        ):
+            supplemental_count = round(
+                personal_count * ratio / config.data.personal_data_ratio
+            )
+            splits[split].extend(build_supplemental_examples(
+                tokenizer=tokenizer,
+                split=split,
+                category=category,
+                count=supplemental_count,
+                max_length=config.model.sequence_length,
+                max_target_tokens=config.data.max_target_tokens,
+                seed=config.training.seed,
+            ))
+        splits[split].sort(key=lambda row: (row["timestamp"], row["example_id"]))
 
     output = config.data.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -350,6 +370,10 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
 
     relationship_counts = {
         split: dict(sorted(Counter(row["relationship"] for row in rows).items()))
+        for split, rows in splits.items()
+    }
+    source_type_counts = {
+        split: dict(sorted(Counter(row["source_type"] for row in rows).items()))
         for split, rows in splits.items()
     }
     chat_counts = {
@@ -377,6 +401,12 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         "split_method": "complete sessions, chronological within each chat",
         "split_boundaries": split_boundaries,
         "relationship_counts": relationship_counts,
+        "source_type_counts": source_type_counts,
+        "configured_mixture": {
+            "personal_telegram": config.data.personal_data_ratio,
+            "context_retention": config.data.context_retention_ratio,
+            "general_reasoning": config.data.general_reasoning_ratio,
+        },
         "sequence_token_distribution": {
             name: _percentiles([row["sequence_tokens"] for row in rows])
             for name, rows in splits.items()

@@ -29,6 +29,9 @@ class DataConfig(StrictModel):
     max_identical_short_target: int = Field(25, ge=1)
     short_target_max_tokens: int = Field(3, ge=1)
     contains_unredacted_private_data: bool
+    personal_data_ratio: float = Field(0.70, ge=0, le=1)
+    context_retention_ratio: float = Field(0.15, ge=0, le=1)
+    general_reasoning_ratio: float = Field(0.15, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_ratios(self) -> "DataConfig":
@@ -39,6 +42,15 @@ class DataConfig(StrictModel):
                 "This project intentionally contains unredacted private data; "
                 "set data.contains_unredacted_private_data to true to acknowledge it"
             )
+        if abs(
+            self.personal_data_ratio
+            + self.context_retention_ratio
+            + self.general_reasoning_ratio
+            - 1.0
+        ) > 1e-9:
+            raise ValueError("data mixture ratios must add up to 1.0")
+        if self.personal_data_ratio <= 0:
+            raise ValueError("personal_data_ratio must be greater than zero")
         return self
 
 
@@ -55,9 +67,9 @@ class ModelConfig(StrictModel):
 
 
 class TrainingConfig(StrictModel):
-    output_dir: Path = Path("artifacts/training/qwen3.5-4b-r8")
-    lora_rank: int = 8
-    lora_alpha: int = 16
+    output_dir: Path = Path("artifacts/training/qwen3.5-4b-r16")
+    lora_rank: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.05
     learning_rate: float = 3e-5
     micro_batch_size: int = 1

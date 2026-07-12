@@ -41,7 +41,7 @@ personal-ai train --fresh
 Resume a checkpoint explicitly:
 
 ```powershell
-personal-ai train --resume artifacts/training/qwen3.5-4b-r8/checkpoint-100
+personal-ai train --resume artifacts/training/qwen3.5-4b-r16/checkpoint-100
 ```
 
 Or automatically resume the newest checkpoint:
@@ -63,7 +63,7 @@ base `Qwen/Qwen3.5-4B` model in the Hugging Face cache, run from the repository
 root:
 
 ```powershell
-Remove-Item -LiteralPath .\artifacts\training\qwen3.5-4b-r8 -Recurse -Force
+Remove-Item -LiteralPath .\artifacts\training\qwen3.5-4b-r16 -Recurse -Force
 ```
 
 After deleting the directory, the next `personal-ai train` starts a fresh

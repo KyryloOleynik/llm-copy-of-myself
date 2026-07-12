@@ -216,6 +216,12 @@ def require_successful_smoke(config: AppConfig, dataset_sha256: str) -> dict[str
     return metadata
 
 
+def longest_example_indices(dataset_split: Any, limit: int) -> list[int]:
+    """Select the longest prepared examples so a smoke run exercises the VRAM ceiling."""
+    lengths = list(dataset_split["sequence_tokens"])
+    return sorted(range(len(lengths)), key=lambda index: (-lengths[index], index))[:limit]
+
+
 def train(
     config: AppConfig,
     smoke: bool = False,
@@ -263,9 +269,11 @@ def train(
     }
     dataset = load_dataset("json", data_files=data_files)
     if smoke:
-        dataset["train"] = dataset["train"].select(range(min(20, len(dataset["train"]))))
+        dataset["train"] = dataset["train"].select(
+            longest_example_indices(dataset["train"], 20)
+        )
         dataset["validation"] = dataset["validation"].select(
-            range(min(20, len(dataset["validation"])))
+            longest_example_indices(dataset["validation"], 20)
         )
 
     tokenizer = AutoTokenizer.from_pretrained(config.model.base_model, use_fast=True)

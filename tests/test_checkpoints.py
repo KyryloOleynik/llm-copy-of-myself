@@ -6,6 +6,7 @@ import pytest
 from personal_ai.training import (
     _checkpoint_is_resumable,
     _latest_valid_checkpoint,
+    longest_example_indices,
     require_successful_smoke,
 )
 
@@ -57,3 +58,8 @@ def test_full_training_requires_matching_smoke_gate(tmp_path):
         "peak_vram_reserved_bytes": 11 * 1024**3,
     }), encoding="utf-8")
     assert require_successful_smoke(config, "dataset-hash")["model"] == "Qwen/Qwen3.5-4B"
+
+
+def test_smoke_selection_uses_longest_examples():
+    dataset = {"sequence_tokens": [100, 4096, 512, 2048]}
+    assert longest_example_indices(dataset, 2) == [1, 3]
