@@ -3,7 +3,9 @@
 --index-url https://download.pytorch.org/whl/cu128
 --extra-index-url https://pypi.org/simple
 
-torch>=2.7,<3
+# Pin the CUDA-local version. Without +cu128, pip can prefer a newer CPU-only
+# torch release from the PyPI extra index.
+torch==2.11.0+cu128
 accelerate>=1.2,<2
 bitsandbytes>=0.45,<1
 datasets>=3.2,<5

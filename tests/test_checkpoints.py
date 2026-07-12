@@ -8,7 +8,9 @@ from personal_ai.training import (
     _checkpoint_is_resumable,
     _latest_valid_checkpoint,
     longest_example_indices,
+    prepared_dataset_features,
     require_successful_smoke,
+    training_argument_overrides,
 )
 
 
@@ -69,6 +71,35 @@ def test_full_training_requires_matching_smoke_gate(tmp_path):
 def test_smoke_selection_uses_longest_examples():
     dataset = {"sequence_tokens": [100, 4096, 512, 2048]}
     assert longest_example_indices(dataset, 2) == [1, 3]
+
+
+def test_prepared_dataset_identifiers_are_always_strings():
+    features = prepared_dataset_features()
+
+    assert features["chat_id"].dtype == "string"
+    assert features["example_id"].dtype == "string"
+    assert features["session_id"].dtype == "string"
+    assert features["timestamp"].dtype == "string"
+
+
+def test_smoke_disables_evaluation_and_periodic_saves():
+    options = training_argument_overrides(smoke=True)
+
+    assert options["per_device_eval_batch_size"] == 1
+    assert options["eval_strategy"] == "no"
+    assert options["save_strategy"] == "no"
+    assert options["load_best_model_at_end"] is False
+    assert options["prediction_loss_only"] is True
+
+
+def test_full_training_uses_memory_safe_evaluation():
+    options = training_argument_overrides(smoke=False)
+
+    assert options["per_device_eval_batch_size"] == 1
+    assert options["eval_strategy"] == "steps"
+    assert options["save_strategy"] == "steps"
+    assert options["load_best_model_at_end"] is True
+    assert options["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
 
 
 class WeightedModule:

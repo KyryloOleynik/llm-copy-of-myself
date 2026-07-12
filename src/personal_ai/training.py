@@ -182,6 +182,44 @@ def longest_example_indices(dataset_split: Any, limit: int) -> list[int]:
     return sorted(range(len(lengths)), key=lambda index: (-lengths[index], index))[:limit]
 
 
+def prepared_dataset_features() -> Any:
+    """Return a stable schema instead of relying on JSON shard type inference."""
+    from datasets import Features, List, Value
+
+    return Features(
+        {
+            "chat_id": Value("string"),
+            "example_id": Value("string"),
+            "messages": List(
+                {
+                    "content": Value("string"),
+                    "role": Value("string"),
+                }
+            ),
+            "relationship": Value("string"),
+            "sequence_tokens": Value("int64"),
+            "session_id": Value("string"),
+            "source_type": Value("string"),
+            "split": Value("string"),
+            "target_message_ids": List(Value("int64")),
+            "target_tokens": Value("int64"),
+            "timestamp": Value("string"),
+        }
+    )
+
+
+def training_argument_overrides(smoke: bool) -> dict[str, Any]:
+    """Keep smoke bounded and prevent Trainer's large default evaluation batch."""
+    return {
+        "per_device_eval_batch_size": 1,
+        "eval_strategy": "no" if smoke else "steps",
+        "save_strategy": "no" if smoke else "steps",
+        "load_best_model_at_end": not smoke,
+        "prediction_loss_only": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+    }
+
+
 def train(
     config: AppConfig,
     smoke: bool = False,
@@ -224,7 +262,7 @@ def train(
         "train": str(config.data.output_dir / "train.jsonl"),
         "validation": str(config.data.output_dir / "validation.jsonl"),
     }
-    dataset = load_dataset("json", data_files=data_files)
+    dataset = load_dataset("json", data_files=data_files, features=prepared_dataset_features())
     if smoke:
         dataset["train"] = dataset["train"].select(longest_example_indices(dataset["train"], 20))
         dataset["validation"] = dataset["validation"].select(
@@ -258,8 +296,6 @@ def train(
     ):
         raise RuntimeError("LoRA trainable parameters are empty or include the vision encoder")
 
-    interval = 1 if smoke else config.training.eval_steps
-    save_interval = 1 if smoke else config.training.save_steps
     args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=config.training.micro_batch_size,
@@ -273,10 +309,8 @@ def train(
         tf32=True,
         gradient_checkpointing=config.training.gradient_checkpointing,
         logging_steps=config.training.logging_steps,
-        save_steps=save_interval,
-        eval_strategy="steps",
-        eval_steps=interval,
-        load_best_model_at_end=True,
+        save_steps=config.training.save_steps,
+        eval_steps=config.training.eval_steps,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=2,
@@ -285,12 +319,13 @@ def train(
         seed=config.training.seed,
         data_seed=config.training.seed,
         remove_unused_columns=False,
+        **training_argument_overrides(smoke),
     )
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"],
+        eval_dataset=None if smoke else dataset["validation"],
         data_collator=ReplyOnlyCollator(
             tokenizer, config.model.sequence_length, config.data.max_target_tokens
         ),

@@ -22,7 +22,7 @@ def prepare_data(config: Path = Path("config.yaml")) -> None:
 @app.command()
 def train(
     config: Path = Path("config.yaml"),
-    smoke: bool = typer.Option(False, help="Use at most 20 train/eval examples."),
+    smoke: bool = typer.Option(False, help="Run one worst-case training step without evaluation."),
     resume: str | None = typer.Option(None, help="Checkpoint path, or 'last'."),
     fresh: bool = typer.Option(
         False, help="Ignore existing checkpoints and start from the base model."

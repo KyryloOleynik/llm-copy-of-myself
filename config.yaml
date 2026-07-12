@@ -22,7 +22,7 @@ data:
 
 model:
   base_model: Qwen/Qwen3.5-4B
-  sequence_length: 4096
+  sequence_length: 1024
   thinking_enabled: false
 
 training:
