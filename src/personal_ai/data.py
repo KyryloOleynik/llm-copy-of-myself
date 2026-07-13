@@ -127,9 +127,8 @@ def _fit_example(
     target: dict[str, Any],
     max_length: int,
     max_target_tokens: int,
-    max_context_messages: int,
 ) -> tuple[list[dict[str, str]], int, int] | None:
-    context = list(context)[-max_context_messages:]
+    context = list(context)
     # Avoid rendering an arbitrarily long Telegram session only to discard its
     # oldest turns. This conservative content-only estimate bounds the first
     # real chat-template render; the exact loop below remains authoritative.
@@ -189,7 +188,6 @@ def _build_session_examples(
             target,
             config.model.sequence_length,
             config.data.max_target_tokens,
-            config.data.max_personal_context_messages,
         )
         if fitted is None:
             exclusions["target_too_long_or_context_cannot_fit"] += 1

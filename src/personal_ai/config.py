@@ -25,7 +25,6 @@ class DataConfig(StrictModel):
     validation_ratio: float = Field(0.1, ge=0, le=1)
     test_ratio: float = Field(0.1, ge=0, le=1)
     max_target_tokens: int = Field(256, ge=1)
-    max_personal_context_messages: int = Field(8, ge=1)
     personal_train_examples: int = Field(5779, ge=1)
     max_identical_short_target: int = Field(25, ge=1)
     short_target_max_tokens: int = Field(3, ge=1)

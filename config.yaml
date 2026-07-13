@@ -12,8 +12,6 @@ data:
   validation_ratio: 0.05
   test_ratio: 0.05
   max_target_tokens: 256
-  # Match the earlier style-focused run; long retention is taught by the 8% replay set.
-  max_personal_context_messages: 8
   personal_train_examples: 5779
   max_identical_short_target: 25
   short_target_max_tokens: 3

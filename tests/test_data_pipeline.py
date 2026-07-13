@@ -34,7 +34,6 @@ def _config(tmp_path: Path):
             train_ratio=0.8,
             validation_ratio=0.1,
             max_target_tokens=256,
-            max_personal_context_messages=8,
             personal_train_examples=9,
             max_identical_short_target=25,
             short_target_max_tokens=3,

@@ -20,10 +20,9 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
   - Fewer than 3 sessions: train only.
 - Add the shared relationship system prompt, preserve leading owner/assistant turns when
   they precede later user context, and store the session ID plus actual target timestamp.
-- Keep at most the eight most recent personal-chat context messages, matching the earlier
-  style-focused Qwen3-8B run. Use the separate context-retention replay set for longer
-  dependencies. The Qwen3.5 tokenizer still enforces the 1,024-token hard limit and a
-  256-token target limit.
+- Keep as much preceding personal-chat context as fits. Remove only the oldest complete
+  turns when the Qwen3.5 tokenizer reaches the 1,024-token hard limit; targets retain a
+  separate 256-token limit. The context-retention replay set supplements these real chats.
 - With seed 42, retain exactly 5,779 personal training examples and cap identical targets
   of three tokens or fewer at 25 per relationship and split. When the global quota removes
   examples, remove them from dominant chats first instead of sampling every chat equally.
