@@ -13,12 +13,11 @@ data:
   test_ratio: 0.05
   max_target_tokens: 256
   personal_train_examples: 5779
-  max_identical_short_target: 25
-  short_target_max_tokens: 3
   contains_unredacted_private_data: true
-  personal_data_ratio: 0.90
+  personal_data_ratio: 0.86
   context_retention_ratio: 0.08
   general_reasoning_ratio: 0.02
+  instruction_following_ratio: 0.04
 
 model:
   base_model: Qwen/Qwen3.5-4B

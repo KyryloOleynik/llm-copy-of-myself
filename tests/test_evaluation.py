@@ -3,9 +3,15 @@ from types import SimpleNamespace
 
 from personal_ai.evaluation import (
     _candidate_paths,
+    _diagnostic_cases,
     _training_progress,
     _write_blind_style_template,
 )
+
+
+def test_instruction_persistence_is_scored_separately_from_context_recall():
+    cases = _diagnostic_cases(256)
+    assert [case["category"] for case in cases] == ["context", "context", "instruction"]
 
 
 def _adapter(path):

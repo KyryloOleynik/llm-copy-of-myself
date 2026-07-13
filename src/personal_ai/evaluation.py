@@ -35,8 +35,8 @@ def _batches(items: list[Any], size: int) -> list[list[Any]]:
 
 def _case_batches(cases: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Keep equal-distance diagnostics together to avoid expensive cross-length padding."""
-    context = [case for case in cases if case["category"] == "context"]
-    other = [case for case in cases if case["category"] != "context"]
+    context = [case for case in cases if case["category"] in {"context", "instruction"}]
+    other = [case for case in cases if case["category"] not in {"context", "instruction"}]
     return [*_batches(context, 3), *_batches(other, EVALUATION_BATCH_SIZE)]
 
 
@@ -77,7 +77,7 @@ def _diagnostic_cases(distance: int) -> list[dict[str, Any]]:
         },
         {
             "id": f"instruction-persistence-{distance}",
-            "category": "context",
+            "category": "instruction",
             "messages": [
                 {
                     "role": "system",
@@ -297,7 +297,7 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
                         )
                     progress.update(len(case_batch))
                 scores: dict[str, float] = {}
-                for category in ("context", "reasoning"):
+                for category in ("context", "instruction", "reasoning"):
                     scored = [
                         row
                         for row in rows
@@ -367,9 +367,9 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
                 "training is incomplete: "
                 f"step {progress_state['global_step']}/{progress_state['max_steps']}"
             )
-        for category in ("context", "reasoning"):
-            if result["scores"][category] + 0.05 < base_scores[category]:
-                reasons.append(f"{category} regressed by more than five percentage points")
+        for category in ("context", "instruction", "reasoning"):
+            if result["scores"][category] < base_scores[category]:
+                reasons.append(f"{category} regressed below the base model")
         if not style_sample:
             reasons.append("held-out style sample is empty")
         elif result["style_total"] < len(style_sample):

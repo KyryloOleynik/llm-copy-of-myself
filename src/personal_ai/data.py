@@ -263,33 +263,6 @@ def _balanced_chat_limit(
     return sorted(selected, key=lambda row: (row["timestamp"], row["example_id"]))
 
 
-def _balance_split(
-    rows: list[dict[str, Any]], tokenizer: Any, config: AppConfig, split: str
-) -> tuple[list[dict[str, Any]], Counter[str]]:
-    exclusions: Counter[str] = Counter()
-    short_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    retained: list[dict[str, Any]] = []
-    for row in rows:
-        target = row["messages"][-1]["content"]
-        target_ids = tokenizer.encode(target, add_special_tokens=False)
-        if len(target_ids) <= config.data.short_target_max_tokens:
-            short_groups[(row["relationship"], target.strip().casefold())].append(row)
-        else:
-            retained.append(row)
-    for key, group in sorted(short_groups.items()):
-        kept = _deterministic_limit(
-            group,
-            config.data.max_identical_short_target,
-            config.training.seed,
-            f"{split}:short:{key[0]}:{key[1]}",
-        )
-        exclusions["duplicate_short_target_cap"] += len(group) - len(kept)
-        retained.extend(kept)
-
-    retained.sort(key=lambda row: (row["timestamp"], row["example_id"]))
-    return retained, exclusions
-
-
 def _percentiles(values: list[int]) -> dict[str, int | float | None]:
     if not values:
         return {"min": None, "median": None, "p95": None, "max": None}
@@ -338,8 +311,6 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
                 )
 
     for split in splits:
-        splits[split], balancing = _balance_split(splits[split], tokenizer, config, split)
-        exclusions.update(balancing)
         if split == "train":
             available = len(splits[split])
             requested = config.data.personal_train_examples
@@ -356,6 +327,7 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         for category, ratio in (
             ("context_retention", config.data.context_retention_ratio),
             ("general_reasoning", config.data.general_reasoning_ratio),
+            ("instruction_following", config.data.instruction_following_ratio),
         ):
             supplemental_count = round(personal_count * ratio / config.data.personal_data_ratio)
             splits[split].extend(
@@ -418,6 +390,7 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
             "personal_telegram": config.data.personal_data_ratio,
             "context_retention": config.data.context_retention_ratio,
             "general_reasoning": config.data.general_reasoning_ratio,
+            "instruction_following": config.data.instruction_following_ratio,
         },
         "sequence_token_distribution": {
             name: _percentiles([row["sequence_tokens"] for row in rows])

@@ -28,7 +28,9 @@ def personal_style_generation_options() -> dict[str, Any]:
         "temperature": 0.7,
         "top_p": 0.8,
         "top_k": 20,
-        "repetition_penalty": 1.0,
+        # Penalize recycling tokens from the conversation history. This remains
+        # modest so characteristic short replies are still possible.
+        "repetition_penalty": 1.1,
     }
 
 

@@ -86,5 +86,5 @@ def test_personal_style_generation_uses_qwen_non_thinking_sampling():
         "temperature": 0.7,
         "top_p": 0.8,
         "top_k": 20,
-        "repetition_penalty": 1.0,
+        "repetition_penalty": 1.1,
     }

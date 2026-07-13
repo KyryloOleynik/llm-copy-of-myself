@@ -150,6 +150,42 @@ def _reasoning_messages(index: int) -> list[dict[str, str]]:
     return [system, {"role": "user", "content": question}, {"role": "assistant", "content": answer}]
 
 
+def _instruction_messages(index: int, rng: random.Random) -> list[dict[str, str]]:
+    """Preserve base-model instruction following while adapting conversational style."""
+    filler = " ".join(
+        f"Нейтральная заметка {item}: значение {rng.randint(100, 999)}."
+        for item in range(2 + index % 5)
+    )
+    variant = index % 3
+    if variant == 0:
+        left = 10 + index
+        right = 2
+        return [
+            {"role": "system", "content": "Каждый ответ должен быть валидным JSON с ключом answer."},
+            {"role": "user", "content": f"{filler} Сколько будет {left} плюс {right}?"},
+            {"role": "assistant", "content": json.dumps({"answer": left + right}, ensure_ascii=False)},
+        ]
+    if variant == 1:
+        code = f"САПФИР-{index:06d}"
+        return [
+            {"role": "system", "content": "Отвечай только запрошенным кодом, без пояснений."},
+            {"role": "user", "content": f"Код этой задачи {code}. {filler} Какой код задачи?"},
+            {"role": "assistant", "content": code},
+        ]
+    value = 1000 + index
+    return [
+        {
+            "role": "system",
+            "content": "Ответ должен быть валидным JSON с ключами answer и unit.",
+        },
+        {"role": "user", "content": f"Запомни сумму {value} гривен. {filler} Какая была сумма?"},
+        {
+            "role": "assistant",
+            "content": json.dumps({"answer": value, "unit": "грн"}, ensure_ascii=False),
+        },
+    ]
+
+
 def build_supplemental_examples(
     tokenizer: Any,
     split: str,
@@ -160,7 +196,7 @@ def build_supplemental_examples(
     seed: int,
 ) -> list[dict[str, Any]]:
     """Generate unique deterministic replay examples in the owner's concise chat style."""
-    if category not in {"context_retention", "general_reasoning"}:
+    if category not in {"context_retention", "general_reasoning", "instruction_following"}:
         raise ValueError(f"Unsupported supplemental category: {category}")
     split_offset = {"train": 0, "validation": 100_000, "test": 200_000}[split]
     rows: list[dict[str, Any]] = []
@@ -169,11 +205,12 @@ def build_supplemental_examples(
     for local_index in range(count):
         index = split_offset + local_index
         rng = random.Random(f"{seed}:{category}:{split}:{index}")
-        messages = (
-            _context_messages(index, rng)
-            if category == "context_retention"
-            else _reasoning_messages(index)
-        )
+        if category == "context_retention":
+            messages = _context_messages(index, rng)
+        elif category == "general_reasoning":
+            messages = _reasoning_messages(index)
+        else:
+            messages = _instruction_messages(index, rng)
         fingerprint = json.dumps(messages, ensure_ascii=False, sort_keys=True)
         if fingerprint in fingerprints:
             raise ValueError(f"Duplicate synthetic conversation generated for {category}")

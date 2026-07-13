@@ -35,11 +35,10 @@ def _config(tmp_path: Path):
             validation_ratio=0.1,
             max_target_tokens=256,
             personal_train_examples=9,
-            max_identical_short_target=25,
-            short_target_max_tokens=3,
             personal_data_ratio=1.0,
             context_retention_ratio=0.0,
             general_reasoning_ratio=0.0,
+            instruction_following_ratio=0.0,
         ),
         training=SimpleNamespace(seed=42),
     )
@@ -174,6 +173,9 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     reasoning_test = build_supplemental_examples(
         split="test", category="general_reasoning", **kwargs
     )
+    instructions = build_supplemental_examples(
+        split="train", category="instruction_following", **kwargs
+    )
     assert context_train == build_supplemental_examples(
         split="train", category="context_retention", **kwargs
     )
@@ -182,7 +184,9 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     )
     assert all(row["source_type"] == "context_retention" for row in context_train)
     assert all(row["source_type"] == "general_reasoning" for row in reasoning)
-    all_rows = context_train + context_test + reasoning + reasoning_test
+    assert all(row["source_type"] == "instruction_following" for row in instructions)
+    assert any(row["messages"][-1]["content"].startswith("{") for row in instructions)
+    all_rows = context_train + context_test + reasoning + reasoning_test + instructions
     assert all(row["messages"][-1]["role"] == "assistant" for row in all_rows)
     fingerprints = {
         json.dumps(row["messages"], ensure_ascii=False, sort_keys=True)
