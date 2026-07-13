@@ -25,7 +25,7 @@ def train(
     smoke: bool = typer.Option(False, help="Run one worst-case training step without evaluation."),
     resume: str | None = typer.Option(None, help="Checkpoint path, or 'last'."),
     fresh: bool = typer.Option(
-        False, help="Ignore existing checkpoints and start from the base model."
+        False, help="Delete the previous run's adapters/checkpoints and start from the base model."
     ),
 ) -> None:
     """Train the QLoRA adapter, automatically resuming the latest checkpoint."""

@@ -25,13 +25,14 @@ class DataConfig(StrictModel):
     validation_ratio: float = Field(0.1, ge=0, le=1)
     test_ratio: float = Field(0.1, ge=0, le=1)
     max_target_tokens: int = Field(256, ge=1)
-    max_examples_per_chat: int = Field(1000, ge=1)
+    max_personal_context_messages: int = Field(8, ge=1)
+    personal_train_examples: int = Field(5779, ge=1)
     max_identical_short_target: int = Field(25, ge=1)
     short_target_max_tokens: int = Field(3, ge=1)
     contains_unredacted_private_data: bool
-    personal_data_ratio: float = Field(0.70, ge=0, le=1)
-    context_retention_ratio: float = Field(0.15, ge=0, le=1)
-    general_reasoning_ratio: float = Field(0.15, ge=0, le=1)
+    personal_data_ratio: float = Field(0.90, ge=0, le=1)
+    context_retention_ratio: float = Field(0.08, ge=0, le=1)
+    general_reasoning_ratio: float = Field(0.02, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_ratios(self) -> "DataConfig":
@@ -75,7 +76,7 @@ class TrainingConfig(StrictModel):
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    learning_rate: float = 3e-5
+    learning_rate: float = 1e-4
     micro_batch_size: int = 1
     gradient_accumulation_steps: int = 16
     epochs: float = 1
@@ -85,15 +86,17 @@ class TrainingConfig(StrictModel):
     eval_steps: int = 50
     warmup_ratio: float = Field(0.03, ge=0, lt=1)
     lr_scheduler_type: str = "cosine"
-    lora_target_policy: str = "language-token-mixers"
+    lora_target_policy: str = "language-token-mixers-and-mlp"
     seed: int = 42
 
     @model_validator(mode="after")
     def validate_policy(self) -> "TrainingConfig":
         if self.method != "qlora":
             raise ValueError("Only training.method: qlora is supported on the 12 GiB target")
-        if self.lora_target_policy != "language-token-mixers":
-            raise ValueError("Only lora_target_policy: language-token-mixers is supported")
+        if self.lora_target_policy != "language-token-mixers-and-mlp":
+            raise ValueError(
+                "Only lora_target_policy: language-token-mixers-and-mlp is supported"
+            )
         if self.save_steps % self.eval_steps != 0:
             raise ValueError("save_steps must be a multiple of eval_steps")
         return self

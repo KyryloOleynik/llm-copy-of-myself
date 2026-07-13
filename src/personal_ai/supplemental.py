@@ -1,16 +1,10 @@
 from __future__ import annotations
 
+import json
 import random
 from typing import Any
 
-from personal_ai.utils import assistant_target_ids
-
-
-SYSTEM_PROMPT = (
-    "You are a careful multilingual assistant. Use earlier conversation state, follow "
-    "persistent instructions, and solve the user's task accurately. Return only the final "
-    "answer unless an output format is explicitly requested."
-)
+from personal_ai.utils import assistant_target_ids, relationship_system_message
 
 
 def _row(
@@ -23,8 +17,7 @@ def _row(
     max_target_tokens: int,
 ) -> dict[str, Any]:
     _, full_ids, target_ids = assistant_target_ids(tokenizer, messages)
-    target_tokens = len(target_ids)
-    if not 0 < target_tokens <= max_target_tokens:
+    if not 0 < len(target_ids) <= max_target_tokens:
         raise ValueError("Supplemental target violates the configured token budget")
     if len(full_ids) > max_length:
         raise ValueError("Supplemental example violates the configured sequence budget")
@@ -33,41 +26,31 @@ def _row(
         "example_id": example_id,
         "chat_id": f"supplemental_{category}",
         "session_id": example_id,
-        "relationship": "general_instruction",
+        "relationship": "friend",
         "source_type": category,
         "split": split,
         "timestamp": f"synthetic-{split}-{index:05d}",
         "target_message_ids": [],
         "sequence_tokens": len(full_ids),
-        "target_tokens": target_tokens,
+        "target_tokens": len(target_ids),
         "messages": messages,
     }
 
 
 def _filler_turns(rng: random.Random, count: int) -> list[dict[str, str]]:
-    topics = (
-        "notebooks",
-        "coffee",
-        "weather",
-        "keyboards",
-        "music",
-        "trains",
-        "gardening",
-        "photography",
-        "books",
-        "bicycles",
-    )
+    topics = ("тетрадей", "треков", "фоток", "игр", "файлов", "уроков", "видосов", "книг")
+    acknowledgements = ("ага", "понял", "ок", "ясно")
     turns: list[dict[str, str]] = []
     for filler_index in range(count):
-        topic = topics[rng.randrange(len(topics))]
+        topic = rng.choice(topics)
         value = rng.randint(10, 99)
         turns.extend(
             [
                 {
                     "role": "user",
-                    "content": f"Unrelated note {filler_index + 1}: I counted {value} {topic} items.",
+                    "content": f"кстати я там насчитал {value} {topic}, запись {filler_index + 1}",
                 },
-                {"role": "assistant", "content": "Understood."},
+                {"role": "assistant", "content": rng.choice(acknowledgements)},
             ]
         )
     return turns
@@ -75,106 +58,95 @@ def _filler_turns(rng: random.Random, count: int) -> list[dict[str, str]]:
 
 def _context_messages(index: int, rng: random.Random) -> list[dict[str, str]]:
     variant = index % 5
-    system = {"role": "system", "content": SYSTEM_PROMPT}
-    fillers = _filler_turns(rng, 3 + index % 4)
+    system = {"role": "system", "content": relationship_system_message("friend")}
+    fillers = _filler_turns(rng, 2 + index % 4)
     if variant == 0:
-        code = f"COBALT-{index:04d}"
+        code = f"COBALT-{index:05d}"
         return [
             system,
-            {"role": "user", "content": f"Remember that the project codename is {code}."},
-            {"role": "assistant", "content": "I will remember it."},
+            {"role": "user", "content": f"запомни код проекта {code}"},
+            {"role": "assistant", "content": "ок запомнил"},
             *fillers,
-            {"role": "user", "content": "What project codename did I give you?"},
+            {"role": "user", "content": "какой я код проекта говорил?"},
             {"role": "assistant", "content": code},
         ]
     if variant == 1:
-        old_day, new_day = ("Tuesday", "Monday") if index % 2 else ("Friday", "Thursday")
+        old_day, new_day = (
+            ("вторник", "понедельник") if index % 2 else ("пятницу", "четверг")
+        )
         return [
             system,
-            {"role": "user", "content": f"The appointment is on {old_day}."},
-            {"role": "assistant", "content": "Noted."},
-            {"role": "user", "content": f"Correction: it is on {new_day}, not {old_day}."},
-            {"role": "assistant", "content": "Updated."},
+            {"role": "user", "content": f"встреча вроде во {old_day}"},
+            {"role": "assistant", "content": "понял"},
+            {"role": "user", "content": f"не, перенесли на {new_day}, номер {index}"},
+            {"role": "assistant", "content": "ок"},
             *fillers,
-            {"role": "user", "content": "Which day is the appointment now?"},
-            {"role": "assistant", "content": new_day},
+            {"role": "user", "content": "так когда теперь встреча?"},
+            {"role": "assistant", "content": f"{new_day}, номер {index}"},
         ]
     if variant == 2:
-        alice_value = f"amber-{index}"
-        boris_value = f"violet-{index}"
+        first_value, second_value = f"amber-{index}", f"violet-{index}"
         return [
             system,
-            {
-                "role": "user",
-                "content": f"Alice selected {alice_value}; Boris selected {boris_value}.",
-            },
-            {"role": "assistant", "content": "I have both selections."},
+            {"role": "user", "content": f"у маши код {first_value}, а у бори {second_value}"},
+            {"role": "assistant", "content": "ага"},
             *fillers,
-            {"role": "user", "content": "What did Boris select?"},
-            {"role": "assistant", "content": boris_value},
+            {"role": "user", "content": "какой там код у бори был?"},
+            {"role": "assistant", "content": second_value},
         ]
     if variant == 3:
-        answer = rng.randint(20, 90)
+        amount = 1000 + index
         return [
             system,
-            {
-                "role": "user",
-                "content": "For my final question, reply as JSON with exactly one key named result.",
-            },
-            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": f"я тебе должен {amount} грн, запомни"},
+            {"role": "assistant", "content": "ок"},
             *fillers,
-            {"role": "user", "content": f"What number did I choose: {answer}?"},
-            {"role": "assistant", "content": f'{{"result": {answer}}}'},
+            {"role": "user", "content": "сколько я тебе там должен?"},
+            {"role": "assistant", "content": f"{amount} грн"},
         ]
-    city = ("Kyiv", "Lviv", "Odesa", "Dnipro")[index % 4]
+    city = ("Киев", "Львов", "Одессу", "Днепр")[index % 4]
     return [
         system,
-        {"role": "user", "content": f"My preferred destination is {city}."},
-        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": f"я решил ехать в {city}, если что, поездка {index}"},
+        {"role": "assistant", "content": "понял"},
         *fillers,
-        {"role": "user", "content": "Returning to the travel topic, where did I prefer to go?"},
-        {"role": "assistant", "content": city},
+        {"role": "user", "content": "куда я в итоге ехать хотел?"},
+        {"role": "assistant", "content": f"{city}, поездка {index}"},
     ]
 
 
-def _reasoning_messages(index: int, rng: random.Random) -> list[dict[str, str]]:
-    variant = index % 8
-    system = {"role": "system", "content": SYSTEM_PROMPT}
+def _reasoning_messages(index: int) -> list[dict[str, str]]:
+    variant = index % 5
+    domain = index // 100_000
+    serial = (index % 100_000) // 5
+    system = {"role": "system", "content": relationship_system_message("friend")}
     if variant == 0:
-        a, b, c = rng.randint(10, 80), rng.randint(2, 15), rng.randint(1, 9)
-        question, answer = f"Calculate ({a} + {b}) × {c}.", str((a + b) * c)
+        a, b, c = 20 + domain * 10_000 + serial * 10, 3, 2
+        question, answer = f"сколько будет ({a} + {b}) * {c}?", str((a + b) * c)
     elif variant == 1:
-        boxes, each, removed = rng.randint(3, 12), rng.randint(4, 20), rng.randint(1, 10)
-        question = f"There are {boxes} boxes with {each} items each. {removed} items are removed. How many remain?"
-        answer = str(boxes * each - removed)
-    elif variant == 2:
-        speed, hours = rng.randint(20, 90), rng.randint(2, 8)
-        question, answer = (
-            f"A vehicle travels {speed} km per hour for {hours} hours. What distance does it cover?",
-            f"{speed * hours} km",
-        )
-    elif variant == 3:
-        values = sorted(rng.sample(range(10, 100), 4))
-        question = f"Order these numbers from largest to smallest: {', '.join(map(str, values))}."
-        answer = ", ".join(map(str, reversed(values)))
-    elif variant == 4:
-        start, duration = rng.randint(8, 15), rng.randint(2, 6)
+        boxes = 3 + domain * 10_000 + serial * 10
+        each, removed = 5, 1
         question = (
-            f"A meeting starts at {start}:00 and lasts {duration} hours. At what hour does it end?"
+            f"короче {boxes} коробок по {each} штук и {removed} убрали, "
+            "сколько осталось?"
         )
-        answer = f"{start + duration}:00"
-    elif variant == 5:
-        word = f"logic{index}"
-        question, answer = f"Reverse the exact string `{word}`.", word[::-1]
-    elif variant == 6:
-        start, step = rng.randint(1, 20), rng.randint(2, 9)
-        sequence = [start + step * offset for offset in range(4)]
-        question = f"Continue the arithmetic sequence: {', '.join(map(str, sequence))}, ?"
-        answer = str(start + step * 4)
+        answer = f"{boxes * each - removed} штук"
+    elif variant == 2:
+        speed, hours = 30 + domain * 10_000 + serial * 10, 2
+        question = f"если ехать {speed} км в час {hours} часа, сколько км получится?"
+        answer = f"{speed * hours} км"
+    elif variant == 3:
+        start = 10 + domain * 10_000 + serial
+        values = [start, start + 13, start + 31, start + 57]
+        question = f"расставь от большего к меньшему: {', '.join(map(str, values))}"
+        answer = ", ".join(map(str, reversed(values)))
     else:
-        red, blue = rng.randint(2, 12), rng.randint(2, 12)
-        question = f"A bag contains {red} red and {blue} blue tokens. How many tokens are in the bag altogether?"
-        answer = str(red + blue)
+        start = 8 + domain
+        duration = 20 + serial
+        day = ("сегодня", "завтра", "в пятницу")[domain]
+        question = f"{day} начало в {start}:00, идёт {duration} минут. во сколько конец?"
+        end_minutes = start * 60 + duration
+        answer = f"{end_minutes // 60}:{end_minutes % 60:02d}"
     return [system, {"role": "user", "content": question}, {"role": "assistant", "content": answer}]
 
 
@@ -187,19 +159,29 @@ def build_supplemental_examples(
     max_target_tokens: int,
     seed: int,
 ) -> list[dict[str, Any]]:
-    """Generate deterministic, split-specific context or reasoning replay examples."""
+    """Generate unique deterministic replay examples in the owner's concise chat style."""
     if category not in {"context_retention", "general_reasoning"}:
         raise ValueError(f"Unsupported supplemental category: {category}")
     split_offset = {"train": 0, "validation": 100_000, "test": 200_000}[split]
-    rows = []
+    rows: list[dict[str, Any]] = []
+    fingerprints: set[str] = set()
+    targets: set[str] = set()
     for local_index in range(count):
         index = split_offset + local_index
         rng = random.Random(f"{seed}:{category}:{split}:{index}")
         messages = (
             _context_messages(index, rng)
             if category == "context_retention"
-            else _reasoning_messages(index, rng)
+            else _reasoning_messages(index)
         )
+        fingerprint = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        if fingerprint in fingerprints:
+            raise ValueError(f"Duplicate synthetic conversation generated for {category}")
+        fingerprints.add(fingerprint)
+        target = messages[-1]["content"].strip().casefold()
+        if target in targets:
+            raise ValueError(f"Duplicate synthetic target generated for {category}: {target}")
+        targets.add(target)
         rows.append(
             _row(
                 tokenizer,

@@ -3,14 +3,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from personal_ai.modeling import TOKEN_MIXER_SUFFIXES, select_language_lora_modules
+from personal_ai.modeling import (
+    LANGUAGE_LORA_SUFFIXES,
+    select_language_lora_modules,
+)
 from personal_ai.training import (
+    _clear_previous_run,
     _checkpoint_is_resumable,
     _latest_valid_checkpoint,
+    _require_resume_dataset_match,
     longest_example_indices,
     prepared_dataset_features,
     require_successful_smoke,
     training_argument_overrides,
+    warmup_steps,
 )
 
 
@@ -45,6 +51,36 @@ def test_saved_peft_adapter_checkpoint_is_resumable(tmp_path):
     (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
 
     assert _checkpoint_is_resumable(checkpoint)
+
+
+def test_fresh_full_run_removes_training_outputs_but_preserves_smoke_gate(tmp_path):
+    checkpoint = tmp_path / "checkpoint-10"
+    checkpoint.mkdir()
+    final = tmp_path / "adapter-final"
+    final.mkdir()
+    (tmp_path / "reproducibility.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "smoke-test.json").write_text("{}", encoding="utf-8")
+    smoke = tmp_path / "smoke"
+    smoke.mkdir()
+
+    _clear_previous_run(tmp_path, smoke=False)
+
+    assert not checkpoint.exists()
+    assert not final.exists()
+    assert not (tmp_path / "reproducibility.json").exists()
+    assert (tmp_path / "smoke-test.json").is_file()
+    assert smoke.is_dir()
+
+
+def test_resume_requires_matching_dataset_hash(tmp_path):
+    (tmp_path / "reproducibility.json").write_text(
+        json.dumps({"dataset_sha256": "old"}), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="different dataset"):
+        _require_resume_dataset_match(tmp_path, "new")
+
+    _require_resume_dataset_match(tmp_path, "old")
 
 
 def test_full_training_requires_matching_smoke_gate(tmp_path):
@@ -102,19 +138,33 @@ def test_full_training_uses_memory_safe_evaluation():
     assert options["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
 
 
+def test_warmup_ratio_is_converted_to_optimizer_steps():
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            micro_batch_size=1,
+            gradient_accumulation_steps=16,
+            epochs=1,
+            warmup_ratio=0.03,
+        )
+    )
+
+    assert warmup_steps(config, train_examples=6720, smoke=False) == 13
+    assert warmup_steps(config, train_examples=6720, smoke=True) == 0
+
+
 class WeightedModule:
     weight = object()
 
 
 class FakeQwenModel:
     def named_modules(self):
-        for suffix in sorted(TOKEN_MIXER_SUFFIXES):
+        for suffix in sorted(LANGUAGE_LORA_SUFFIXES):
             yield f"model.language_model.layers.0.{suffix}", WeightedModule()
         yield "model.visual.blocks.0.out_proj", WeightedModule()
 
 
 def test_only_language_token_mixers_are_selected():
     selected = select_language_lora_modules(FakeQwenModel())
-    assert len(selected) == len(TOKEN_MIXER_SUFFIXES)
+    assert len(selected) == len(LANGUAGE_LORA_SUFFIXES)
     assert all("language_model" in name for name in selected)
     assert all("visual" not in name for name in selected)

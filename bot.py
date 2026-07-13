@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
+import re
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -19,7 +22,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from personal_ai.modeling import generate_reply, load_inference_model
+from aiogram.utils.chat_action import ChatActionSender
+from personal_ai.modeling import (
+    generate_reply,
+    load_inference_model,
+    personal_style_generation_options,
+)
 from personal_ai.utils import load_dotenv, read_json, relationship_system_message, render_chat_ids
 
 
@@ -36,12 +44,19 @@ ADAPTER_PATH = Path(
 )
 MIN_REPLY_DELAY = float(os.getenv("MIN_REPLY_DELAY", "2"))
 MAX_REPLY_DELAY = float(os.getenv("MAX_REPLY_DELAY", "60"))
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
-MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
+READING_CHARS_PER_SECOND = float(os.getenv("READING_CHARS_PER_SECOND", "35"))
+TYPING_WORDS_PER_MINUTE = float(os.getenv("TYPING_WORDS_PER_MINUTE", "42"))
+MAX_POST_GENERATION_DELAY = float(os.getenv("MAX_POST_GENERATION_DELAY", "5"))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "96"))
+MAX_REPLY_PARTS = int(os.getenv("MAX_REPLY_PARTS", "4"))
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "30"))
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
 STATE_DATABASE = Path(os.getenv("STATE_DATABASE", str(ROOT / "data/bot.sqlite3")))
 EVALUATION_REPORT = Path(
     os.getenv("EVALUATION_REPORT", str(ROOT / "data/processed/evaluation/evaluation.json"))
+)
+PREPARED_MANIFEST = Path(
+    os.getenv("PREPARED_MANIFEST", str(ROOT / "data/processed/manifest.json"))
 )
 RELATIONSHIPS = {
     "close_friend": "Close friend",
@@ -58,6 +73,112 @@ pending_chats: dict[int, "PendingChat"] = {}
 chat_history: dict[int, list[dict[str, str]]] = {}
 generation_queue: asyncio.Queue["GenerationRequest"] | None = None
 user_relationships: dict[int, str] = {}
+
+
+def _has_adapter_weights(path: Path) -> bool:
+    return (path / "adapter_config.json").is_file() and any(
+        (path / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin")
+    )
+
+
+def _is_complete_checkpoint(path: Path) -> bool:
+    return _has_adapter_weights(path) and all(
+        (path / name).is_file()
+        for name in ("trainer_state.json", "optimizer.pt", "scheduler.pt")
+    )
+
+
+def resolve_adapter_path(preferred: Path) -> Path:
+    """Use adapter-final when available, otherwise the newest complete checkpoint."""
+    if _has_adapter_weights(preferred):
+        return preferred
+    if preferred.name != "adapter-final":
+        raise FileNotFoundError(f"Trained adapter not found or incomplete: {preferred}")
+
+    checkpoints: list[tuple[int, Path]] = []
+    for path in preferred.parent.glob("checkpoint-*"):
+        match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+        if match and path.is_dir() and _is_complete_checkpoint(path):
+            checkpoints.append((int(match.group(1)), path))
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"Final adapter not found and no complete checkpoints exist in {preferred.parent}"
+        )
+    checkpoint = max(checkpoints, key=lambda item: item[0])[1]
+    logging.warning("Final adapter is unavailable; loading latest checkpoint: %s", checkpoint)
+    return checkpoint
+
+
+def require_adapter_dataset_match(adapter_path: Path, manifest_path: Path) -> None:
+    """Refuse to run an adapter trained against a different prepared dataset."""
+    metadata_path = adapter_path.parent / "reproducibility.json"
+    if not manifest_path.is_file() or not metadata_path.is_file():
+        raise RuntimeError("Prepared dataset or adapter reproducibility metadata is missing")
+    dataset_hash = read_json(manifest_path).get("dataset_sha256")
+    trained_hash = read_json(metadata_path).get("dataset_sha256")
+    if not dataset_hash or trained_hash != dataset_hash:
+        raise RuntimeError(
+            "Adapter was trained on a different dataset; run smoke training and full "
+            "training again with --fresh"
+        )
+
+
+def natural_response_delay(incoming: str, reply: str) -> float:
+    """Estimate how long a person would need to read and compose this reply."""
+    reading_seconds = min(6.0, max(0.8, len(incoming) / READING_CHARS_PER_SECOND))
+    reply_words = max(1, len(reply.split()))
+    typing_seconds = min(12.0, reply_words * 60.0 / TYPING_WORDS_PER_MINUTE)
+    variation = random.uniform(0.85, 1.15)
+    return (reading_seconds + typing_seconds) * variation
+
+
+def between_message_delay(message: str) -> float:
+    """Pause briefly between separately sent lines without making long replies tedious."""
+    return min(2.0, max(0.45, len(message) / 80.0)) * random.uniform(0.85, 1.15)
+
+
+def safe_reply_parts(reply: str) -> list[str]:
+    """Deduplicate generated lines and cap Telegram messages from one model response."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for line in reply.splitlines():
+        part = line.strip()
+        normalized = part.casefold()
+        if not part or normalized in seen:
+            continue
+        seen.add(normalized)
+        parts.append(part)
+        if len(parts) == MAX_REPLY_PARTS:
+            break
+    return parts
+
+
+def incoming_message_content(message: Message) -> str | None:
+    """Represent Telegram media as text markers the language model understands."""
+    media_checks = (
+        ("photo", "[sent image]"),
+        ("video", "[sent video]"),
+        ("video_note", "[sent video]"),
+        ("animation", "[sent animation]"),
+        ("voice", "[sent voice message]"),
+        ("audio", "[sent audio file]"),
+        ("document", "[sent document]"),
+        ("sticker", "[sent sticker]"),
+        ("location", "[sent location]"),
+        ("venue", "[sent location]"),
+        ("contact", "[sent contact]"),
+        ("poll", "[sent poll]"),
+        ("dice", "[sent dice]"),
+    )
+    marker = next(
+        (placeholder for attribute, placeholder in media_checks if getattr(message, attribute, None)),
+        None,
+    )
+    if marker:
+        caption = (message.caption or "").strip()
+        return f"{marker}\n{caption}" if caption else marker
+    text = (message.text or message.caption or "").strip()
+    return text or None
 
 
 def relationship_keyboard() -> InlineKeyboardMarkup:
@@ -93,12 +214,26 @@ def save_relationship(user_id: int, relationship: str) -> None:
         )
 
 
+def confirm_unverified_adapter(message: str) -> bool:
+    """Require explicit terminal confirmation before bypassing a failed evaluation gate."""
+    if not sys.stdin.isatty():
+        return False
+    print(f"WARNING: {message}", file=sys.stderr)
+    try:
+        answer = input("Continue with this unverified adapter? [y/N]: ").strip().casefold()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return False
+    return answer in {"y", "yes"}
+
+
 class LocalModel:
     """A base model and trained adapter kept resident for the bot's lifetime."""
 
     def __init__(self, base_model: str, adapter_path: Path) -> None:
         if not adapter_path.is_dir():
             raise FileNotFoundError(f"Trained adapter not found: {adapter_path}")
+        require_adapter_dataset_match(adapter_path, PREPARED_MANIFEST)
         if not EVALUATION_REPORT.is_file():
             raise RuntimeError(
                 f"Adapter acceptance report is missing: {EVALUATION_REPORT}. "
@@ -107,10 +242,13 @@ class LocalModel:
         evaluation = read_json(EVALUATION_REPORT)
         result = evaluation.get("results", {}).get(adapter_path.name, {})
         if not result.get("accepted"):
-            raise RuntimeError(
+            gate_error = (
                 f"Adapter {adapter_path.name} has not passed the evaluation gate: "
                 f"{result.get('acceptance_reasons', ['candidate not found'])}"
             )
+            if not confirm_unverified_adapter(gate_error):
+                raise RuntimeError(gate_error)
+            logging.warning("Evaluation gate bypassed by explicit console confirmation")
 
         logging.info("Loading tokenizer and model into memory from %s", adapter_path)
         self.torch, self.tokenizer, self.model = load_inference_model(
@@ -139,10 +277,7 @@ class LocalModel:
             self.model,
             messages,
             max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
-            repetition_penalty=1.05,
+            **personal_style_generation_options(),
         )
         return reply
 
@@ -220,20 +355,37 @@ async def wait_and_reply(pending: PendingChat) -> None:
         if pending_chats.get(pending.chat_id) is pending:
             del pending_chats[pending.chat_id]
 
-        assert generation_queue is not None
-        result = asyncio.get_running_loop().create_future()
-        await generation_queue.put(
-            GenerationRequest(
-                pending.chat_id,
-                pending.relationship,
-                "\n".join(pending.messages),
-                result,
+        incoming = "\n".join(pending.messages)
+        started_at = time.monotonic()
+        async with ChatActionSender(
+            bot=pending.bot,
+            chat_id=pending.chat_id,
+            action=ChatAction.TYPING,
+            interval=4.5,
+        ):
+            assert generation_queue is not None
+            result = asyncio.get_running_loop().create_future()
+            await generation_queue.put(
+                GenerationRequest(
+                    pending.chat_id,
+                    pending.relationship,
+                    incoming,
+                    result,
+                )
             )
-        )
-        reply = await result
-        for part in (line.strip() for line in reply.splitlines()):
-            if part:
-                await pending.bot.send_message(pending.chat_id, part)
+            reply = await result
+            elapsed = time.monotonic() - started_at
+            remaining_delay = max(0.0, natural_response_delay(incoming, reply) - elapsed)
+            await asyncio.sleep(min(remaining_delay, MAX_POST_GENERATION_DELAY))
+
+        parts = safe_reply_parts(reply)
+        if not parts:
+            parts = ["I couldn't generate a coherent reply right now."]
+        for index, part in enumerate(parts):
+            if index:
+                await pending.bot.send_chat_action(pending.chat_id, ChatAction.TYPING)
+                await asyncio.sleep(between_message_delay(part))
+            await pending.bot.send_message(pending.chat_id, part)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -242,18 +394,18 @@ async def wait_and_reply(pending: PendingChat) -> None:
 
 
 def enqueue_message(message: Message, relationship: str) -> None:
-    text = message.text or message.caption
-    if not text:
+    content = incoming_message_content(message)
+    if not content:
         return
 
     now = time.monotonic()
     pending = pending_chats.get(message.chat.id)
     if pending is None:
-        pending = PendingChat(message.bot, message.chat.id, now, now, relationship, [text])
+        pending = PendingChat(message.bot, message.chat.id, now, now, relationship, [content])
         pending_chats[message.chat.id] = pending
         pending.task = asyncio.create_task(wait_and_reply(pending))
     else:
-        pending.messages.append(text)
+        pending.messages.append(content)
         pending.last_received = now
         pending.wakeup.set()
 
@@ -314,7 +466,7 @@ async def relationship_handler(query: CallbackQuery) -> None:
 
 @dp.message()
 async def reply_handler(message: Message) -> None:
-    """Queue text/caption messages instead of echoing or replying immediately."""
+    """Queue text and normalized media placeholders for the local language model."""
     if message.from_user is None:
         return
     relationship = user_relationships.get(message.from_user.id)
@@ -333,10 +485,16 @@ async def main() -> None:
         raise RuntimeError("BOT_TOKEN is not set in the environment or .env file")
     if MIN_REPLY_DELAY < 0 or MAX_REPLY_DELAY < MIN_REPLY_DELAY:
         raise ValueError("Reply delays must satisfy 0 <= MIN_REPLY_DELAY <= MAX_REPLY_DELAY")
+    if READING_CHARS_PER_SECOND <= 0 or TYPING_WORDS_PER_MINUTE <= 0:
+        raise ValueError("Reading speed and typing speed must be greater than zero")
+    if MAX_POST_GENERATION_DELAY < 0:
+        raise ValueError("MAX_POST_GENERATION_DELAY must be non-negative")
+    if MAX_REPLY_PARTS < 1:
+        raise ValueError("MAX_REPLY_PARTS must be at least one")
 
     load_relationships()
     # Load synchronously before polling: no request can arrive before the model is ready.
-    model = LocalModel(BASE_MODEL, ADAPTER_PATH)
+    model = LocalModel(BASE_MODEL, resolve_adapter_path(ADAPTER_PATH))
     generation_queue = asyncio.Queue()
     worker = asyncio.create_task(generation_worker())
     bot = Bot(token=TOKEN)

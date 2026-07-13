@@ -15,6 +15,7 @@ safetensors>=0.5,<1
 # Transformers 5.13.1 commit tested with Qwen3.5 chat templates.
 transformers @ git+https://github.com/huggingface/transformers.git@4626421dc6b741a329300682a6408246ee465490
 trl>=0.15,<1
+triton-windows==3.7.1.post27
 
 # Installs this repository and its YAML, configuration, and CLI dependencies.
 -e .

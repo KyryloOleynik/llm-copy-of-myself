@@ -6,8 +6,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tqdm.auto import tqdm
+
 from personal_ai.config import AppConfig
-from personal_ai.modeling import generate_reply, load_inference_model
+from personal_ai.modeling import (
+    generate_replies,
+    load_inference_model,
+    personal_style_generation_options,
+)
 from personal_ai.training import validate_prepared_dataset
 from personal_ai.utils import (
     iter_jsonl,
@@ -19,6 +25,19 @@ from personal_ai.utils import (
 
 
 DISTANCES = (256, 512, 768, 1024, 2048, 4096, 8192)
+STYLE_SAMPLE_SIZE = 25
+EVALUATION_BATCH_SIZE = 4
+
+
+def _batches(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _case_batches(cases: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Keep equal-distance diagnostics together to avoid expensive cross-length padding."""
+    context = [case for case in cases if case["category"] == "context"]
+    other = [case for case in cases if case["category"] != "context"]
+    return [*_batches(context, 3), *_batches(other, EVALUATION_BATCH_SIZE)]
 
 
 def _diagnostic_cases(distance: int) -> list[dict[str, Any]]:
@@ -116,21 +135,39 @@ def _reasoning_cases() -> list[dict[str, Any]]:
     ]
 
 
+def _adapter_is_loadable(path: Path) -> bool:
+    return (path / "adapter_config.json").is_file() and any(
+        (path / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin")
+    )
+
+
 def _candidate_paths(output_dir: Path) -> list[Path | None]:
-    candidates: list[Path | None] = [None]
     checkpoints = sorted(
         (
             path
             for path in output_dir.glob("checkpoint-*")
-            if path.is_dir() and (path / "adapter_config.json").is_file()
+            if path.is_dir() and _adapter_is_loadable(path)
         ),
         key=lambda path: int(path.name.rsplit("-", 1)[-1]),
     )
-    candidates.extend(checkpoints)
     final = output_dir / "adapter-final"
-    if final.is_dir() and (final / "adapter_config.json").is_file():
-        candidates.append(final)
-    return candidates
+    if final.is_dir() and _adapter_is_loadable(final):
+        return [None, final]
+    if checkpoints:
+        latest = checkpoints[-1]
+        state_path = latest / "trainer_state.json"
+        if state_path.is_file():
+            best_value = read_json(state_path).get("best_model_checkpoint")
+            if best_value:
+                best = Path(best_value)
+                if not best.is_absolute():
+                    best = output_dir / best.name
+                if best.is_dir() and _adapter_is_loadable(best):
+                    return [None, best]
+        return [None, latest]
+    raise FileNotFoundError(
+        f"No adapter-final or valid checkpoint containing adapter_config.json in {output_dir}"
+    )
 
 
 def _messages_at_distance(
@@ -171,17 +208,6 @@ def _score_case(output: str, expected: list[str]) -> bool | None:
     return all(value.casefold() in normalized for value in expected)
 
 
-def _style_rating(config: AppConfig, candidate: str) -> tuple[int, int]:
-    path = config.data.output_dir / "style_ratings.json"
-    if not path.is_file():
-        return 0, 0
-    ratings = read_json(path).get(candidate, {})
-    wins, total = int(ratings.get("wins", 0)), int(ratings.get("total", 0))
-    if wins < 0 or total < 0 or wins > total:
-        raise ValueError(f"Invalid blind style rating for {candidate}: {wins}/{total}")
-    return wins, total
-
-
 def _training_vram_ok(config: AppConfig) -> tuple[bool, int | None]:
     path = config.training.output_dir / "reproducibility.json"
     if not path.is_file():
@@ -191,71 +217,141 @@ def _training_vram_ok(config: AppConfig) -> tuple[bool, int | None]:
     return bool(peak is not None and peak < 12 * 1024**3), peak
 
 
+def _training_progress(adapter: Path | None) -> dict[str, int | float | bool] | None:
+    if adapter is None or not adapter.name.startswith("checkpoint-"):
+        return None
+    state_path = adapter / "trainer_state.json"
+    if not state_path.is_file():
+        return None
+    state = read_json(state_path)
+    step = int(state.get("global_step", int(adapter.name.rsplit("-", 1)[-1])))
+    max_steps = int(state.get("max_steps", 0))
+    return {
+        "global_step": step,
+        "max_steps": max_steps,
+        "epoch": float(state.get("epoch", 0.0)),
+        "complete": bool(max_steps and step >= max_steps),
+    }
+
+
 def evaluate_checkpoints(config: AppConfig) -> Path:
     """Run deterministic diagnostics and create a machine-readable acceptance report."""
     manifest = validate_prepared_dataset(config)
+    training_metadata_path = config.training.output_dir / "reproducibility.json"
+    if not training_metadata_path.is_file() or read_json(training_metadata_path).get(
+        "dataset_sha256"
+    ) != manifest["dataset_sha256"]:
+        raise RuntimeError(
+            "Available adapter/checkpoints do not match the prepared dataset; "
+            "train a new run with --fresh before evaluation"
+        )
     cases = [case for distance in DISTANCES for case in _diagnostic_cases(distance)]
     cases.extend(_reasoning_cases())
-    test_rows = list(iter_jsonl(config.data.output_dir / "test.jsonl"))
+    test_rows = [
+        row
+        for row in iter_jsonl(config.data.output_dir / "test.jsonl")
+        if row.get("source_type") == "personal_telegram"
+    ]
     sample_rng = random.Random(config.training.seed)
-    style_sample = sample_rng.sample(test_rows, min(50, len(test_rows)))
+    style_sample = sample_rng.sample(test_rows, min(STYLE_SAMPLE_SIZE, len(test_rows)))
     style_outputs: dict[str, dict[str, str]] = {}
     results: dict[str, Any] = {}
-    for adapter in _candidate_paths(config.training.output_dir):
-        candidate = "base" if adapter is None else adapter.name
-        torch, tokenizer, model = load_inference_model(config.model.base_model, adapter, {"": 0})
-        rows = []
-        for case in cases:
-            messages = _messages_at_distance(
-                tokenizer, case["messages"], case.get("target_distance")
+    candidates = _candidate_paths(config.training.output_dir)
+    total_generations = len(candidates) * (len(cases) + len(style_sample))
+    with tqdm(total=total_generations, desc="Evaluating", unit="reply") as progress:
+        for adapter in candidates:
+            candidate = "base" if adapter is None else adapter.name
+            progress.set_postfix_str(candidate)
+            torch, tokenizer, model = load_inference_model(
+                config.model.base_model, adapter, {"": 0}
             )
-            output, actual_tokens = generate_reply(
-                torch,
-                tokenizer,
-                model,
-                messages,
-                max_new_tokens=128,
-                do_sample=False,
-            )
-            rows.append(
-                {
-                    "id": case["id"],
-                    "category": case["category"],
-                    "target_distance": case.get("target_distance"),
-                    "actual_prompt_tokens": actual_tokens,
-                    "output": output,
-                    "passed": _score_case(output, case["expected"]),
+            try:
+                rows = []
+                for case_batch in _case_batches(cases):
+                    messages_batch = [
+                        _messages_at_distance(
+                            tokenizer, case["messages"], case.get("target_distance")
+                        )
+                        for case in case_batch
+                    ]
+                    outputs = generate_replies(
+                        torch,
+                        tokenizer,
+                        model,
+                        messages_batch,
+                        max_new_tokens=128,
+                        do_sample=False,
+                    )
+                    for case, (output, actual_tokens) in zip(
+                        case_batch, outputs, strict=True
+                    ):
+                        rows.append(
+                            {
+                                "id": case["id"],
+                                "category": case["category"],
+                                "target_distance": case.get("target_distance"),
+                                "actual_prompt_tokens": actual_tokens,
+                                "output": output,
+                                "passed": _score_case(output, case["expected"]),
+                            }
+                        )
+                    progress.update(len(case_batch))
+                scores: dict[str, float] = {}
+                for category in ("context", "reasoning"):
+                    scored = [
+                        row
+                        for row in rows
+                        if row["category"] == category and row["passed"] is not None
+                    ]
+                    scores[category] = sum(bool(row["passed"]) for row in scored) / len(scored)
+                style_outputs[candidate] = {}
+                style_sample_by_length = sorted(
+                    style_sample,
+                    key=lambda row: len(
+                        render_chat_ids(tokenizer, row["messages"][:-1], generation=True)
+                    ),
+                )
+                for batch_index, style_batch in enumerate(
+                    _batches(style_sample_by_length, EVALUATION_BATCH_SIZE)
+                ):
+                    torch.manual_seed(config.training.seed + batch_index)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(config.training.seed + batch_index)
+                    outputs = generate_replies(
+                        torch,
+                        tokenizer,
+                        model,
+                        [row["messages"][:-1] for row in style_batch],
+                        max_new_tokens=128,
+                        **personal_style_generation_options(),
+                    )
+                    for row, (output, _) in zip(style_batch, outputs, strict=True):
+                        style_outputs[candidate][row["example_id"]] = output
+                    progress.update(len(style_batch))
+                results[candidate] = {
+                    "adapter": str(adapter) if adapter else None,
+                    "training_progress": _training_progress(adapter),
+                    "scores": scores,
+                    "style_wins": 0,
+                    "style_total": 0,
+                    "style_win_rate": None,
+                    "cases": rows,
                 }
-            )
-        scores: dict[str, float] = {}
-        for category in ("context", "reasoning"):
-            scored = [
-                row for row in rows if row["category"] == category and row["passed"] is not None
-            ]
-            scores[category] = sum(bool(row["passed"]) for row in scored) / len(scored)
-        wins, total = _style_rating(config, candidate)
-        style_outputs[candidate] = {}
-        for row in style_sample:
-            output, _ = generate_reply(
-                torch,
-                tokenizer,
-                model,
-                row["messages"][:-1],
-                max_new_tokens=128,
-                do_sample=False,
-            )
-            style_outputs[candidate][row["example_id"]] = output
-        results[candidate] = {
-            "adapter": str(adapter) if adapter else None,
-            "scores": scores,
-            "style_wins": wins,
-            "style_total": total,
-            "style_win_rate": wins / total if total else None,
-            "cases": rows,
-        }
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
+            finally:
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    output_dir = config.data.output_dir / "evaluation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    style_ratings = _write_blind_style_template(
+        config, output_dir, style_sample, style_outputs
+    )
+    for candidate, rating in style_ratings.items():
+        wins, total = rating
+        results[candidate]["style_wins"] = wins
+        results[candidate]["style_total"] = total
+        results[candidate]["style_win_rate"] = wins / total if total else None
 
     base_scores = results["base"]["scores"]
     vram_ok, peak_vram = _training_vram_ok(config)
@@ -265,6 +361,12 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
             result["acceptance_reasons"] = ["base model is a comparison baseline"]
             continue
         reasons = []
+        progress_state = result.get("training_progress")
+        if progress_state and not progress_state["complete"]:
+            reasons.append(
+                "training is incomplete: "
+                f"step {progress_state['global_step']}/{progress_state['max_steps']}"
+            )
         for category in ("context", "reasoning"):
             if result["scores"][category] + 0.05 < base_scores[category]:
                 reasons.append(f"{category} regressed by more than five percentage points")
@@ -281,8 +383,6 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
         result["accepted"] = not reasons
         result["acceptance_reasons"] = reasons
 
-    output_dir = config.data.output_dir / "evaluation"
-    output_dir.mkdir(parents=True, exist_ok=True)
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model": config.model.base_model,
@@ -292,7 +392,6 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
     }
     report_path = output_dir / "evaluation.json"
     write_json(report_path, report)
-    _write_blind_style_template(config, output_dir, style_sample, style_outputs)
     return report_path
 
 
@@ -301,8 +400,8 @@ def _write_blind_style_template(
     output_dir: Path,
     sample: list[dict[str, Any]],
     outputs: dict[str, dict[str, str]],
-) -> None:
-    """Create anonymized base/adapter comparisons plus a separate answer key."""
+) -> dict[str, tuple[int, int]]:
+    """Write blind comparisons and preserve choices only for byte-identical reviews."""
     rng = random.Random(config.training.seed)
     reviews = []
     answer_key: dict[str, dict[str, str]] = {}
@@ -328,13 +427,40 @@ def _write_blind_style_template(
                 }
             )
             answer_key[candidate][review_id] = adapter_label
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    review_path = output_dir / "blind_style_review.json"
+    if review_path.is_file():
+        existing_by_id = {
+            review.get("review_id", ""): review
+            for review in read_json(review_path).get("reviews", [])
+        }
+    for review in reviews:
+        existing = existing_by_id.get(review["review_id"])
+        if existing is None or existing.get("preferred") not in {"A", "B"}:
+            continue
+        comparable_existing = {key: value for key, value in existing.items() if key != "preferred"}
+        comparable_new = {key: value for key, value in review.items() if key != "preferred"}
+        if comparable_existing == comparable_new:
+            review["preferred"] = existing["preferred"]
+
     template = {
         "instructions": (
             "Choose A or B for each prompt without opening blind_style_key.json. "
-            "After review, use the key to count adapter wins and write style_ratings.json "
-            "as {candidate: {wins: integer, total: integer}}."
+            "Save this file and rerun personal-ai evaluate. Matching choices are counted "
+            "automatically; changed prompts or outputs reset their choices."
         ),
         "reviews": reviews,
     }
-    write_json(output_dir / "blind_style_review.json", template)
+    ratings: dict[str, tuple[int, int]] = {}
+    for candidate, candidate_key in answer_key.items():
+        candidate_reviews = [
+            review for review in reviews if review["review_id"] in candidate_key
+        ]
+        rated = [review for review in candidate_reviews if review["preferred"] in {"A", "B"}]
+        wins = sum(
+            review["preferred"] == candidate_key[review["review_id"]] for review in rated
+        )
+        ratings[candidate] = wins, len(rated)
+    write_json(review_path, template)
     write_json(output_dir / "blind_style_key.json", answer_key)
+    return ratings

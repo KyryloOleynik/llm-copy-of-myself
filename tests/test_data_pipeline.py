@@ -2,7 +2,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from personal_ai.data import merge_turns, prepare_dataset, split_dataset_sessions
+from personal_ai.data import (
+    _balanced_chat_limit,
+    merge_turns,
+    prepare_dataset,
+    split_dataset_sessions,
+)
 from personal_ai.supplemental import build_supplemental_examples
 from tests.helpers import FakeTokenizer
 
@@ -29,7 +34,8 @@ def _config(tmp_path: Path):
             train_ratio=0.8,
             validation_ratio=0.1,
             max_target_tokens=256,
-            max_examples_per_chat=1000,
+            max_personal_context_messages=8,
+            personal_train_examples=9,
             max_identical_short_target=25,
             short_target_max_tokens=3,
             personal_data_ratio=1.0,
@@ -62,6 +68,19 @@ def test_media_is_preserved_and_marked_media_only():
     )
     assert turns[0]["content"] == "[sent image]"
     assert turns[0]["media_only"] is True
+
+
+def test_assistant_media_only_messages_are_omitted():
+    turns = merge_turns(
+        [
+            _message(1, "user", "покажи", "2026-01-01T00:00:00"),
+            _message(2, "assistant", "", "2026-01-01T00:01:00", photo="photo.jpg"),
+            _message(3, "assistant", "вот", "2026-01-01T00:02:00"),
+        ],
+        "owner",
+    )
+    assert turns[-1]["content"] == "вот"
+    assert "[sent " not in turns[-1]["content"]
 
 
 def test_session_split_rules():
@@ -153,6 +172,9 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     )
     context_test = build_supplemental_examples(split="test", category="context_retention", **kwargs)
     reasoning = build_supplemental_examples(split="train", category="general_reasoning", **kwargs)
+    reasoning_test = build_supplemental_examples(
+        split="test", category="general_reasoning", **kwargs
+    )
     assert context_train == build_supplemental_examples(
         split="train", category="context_retention", **kwargs
     )
@@ -161,4 +183,36 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     )
     assert all(row["source_type"] == "context_retention" for row in context_train)
     assert all(row["source_type"] == "general_reasoning" for row in reasoning)
-    assert all(row["messages"][-1]["role"] == "assistant" for row in context_train + reasoning)
+    all_rows = context_train + context_test + reasoning + reasoning_test
+    assert all(row["messages"][-1]["role"] == "assistant" for row in all_rows)
+    fingerprints = {
+        json.dumps(row["messages"], ensure_ascii=False, sort_keys=True)
+        for row in all_rows
+    }
+    assert len(fingerprints) == len(all_rows)
+    targets = [
+        row["messages"][-1]["content"].strip().casefold()
+        for row in all_rows
+    ]
+    assert len(targets) == len(set(targets))
+
+
+def test_personal_limit_removes_excess_from_dominant_chats():
+    rows = [
+        {
+            "chat_id": chat_id,
+            "timestamp": f"2026-01-01T00:{index:02d}:00",
+            "example_id": f"{chat_id}-{index}",
+        }
+        for chat_id, count in (("large", 10), ("medium", 4), ("small", 2))
+        for index in range(count)
+    ]
+
+    selected = _balanced_chat_limit(rows, 12, seed=42)
+    counts = {
+        chat_id: sum(row["chat_id"] == chat_id for row in selected)
+        for chat_id in ("large", "medium", "small")
+    }
+
+    assert len(selected) == 12
+    assert counts == {"large": 6, "medium": 4, "small": 2}

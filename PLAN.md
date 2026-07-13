@@ -20,15 +20,19 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
   - Fewer than 3 sessions: train only.
 - Add the shared relationship system prompt, preserve leading owner/assistant turns when
   they precede later user context, and store the session ID plus actual target timestamp.
-- Use the Qwen3.5 tokenizer to keep every complete example within 4,096 tokens. Targets
-  may use at most 256 tokens; skip only an oversized target and remove oldest complete
-  context turns when necessary.
-- With seed 42, cap training examples at 1,000 per chat and identical targets of three
-  tokens or fewer at 25 per relationship and split.
-- Mix each split as 70% personal Telegram examples, 15% deterministic context-retention
-  conversations, and 15% deterministic general-reasoning problems. Generate validation
-  and test supplements from disjoint value ranges so the capabilities affect checkpoint
-  selection without leaking exact training answers.
+- Keep at most the eight most recent personal-chat context messages, matching the earlier
+  style-focused Qwen3-8B run. Use the separate context-retention replay set for longer
+  dependencies. The Qwen3.5 tokenizer still enforces the 1,024-token hard limit and a
+  256-token target limit.
+- With seed 42, retain exactly 5,779 personal training examples and cap identical targets
+  of three tokens or fewer at 25 per relationship and split. When the global quota removes
+  examples, remove them from dominant chats first instead of sampling every chat equally.
+- Mix each split as 90% personal Telegram examples, 8% unique context-retention
+  conversations, and 2% unique general-reasoning problems written in the owner's concise
+  chat style. Synthetic conversations and their final targets must both be unique; generate
+  validation and test supplements from disjoint value ranges.
+- Preserve media placeholders only in user context; never train an assistant target to
+  emit `[sent image]`, `[sent video]`, or another unavailable media action.
 - Produce the combined tracked `dataset.json`, train/validation/test JSONL files, and a
   manifest containing hashes, counts, exclusions, split boundaries, token distributions,
   relationship distributions, and chat dominance.
@@ -47,8 +51,8 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
   `in_proj_b`, and `out_proj`.
 - Fail before training when expected projections are absent, a vision parameter is
   trainable, prepared artifacts do not match the configuration, or a session crosses splits.
-- Train rank 16, alpha 32, dropout 0.05, learning rate `3e-5`, cosine schedule, 3% warmup,
-  micro-batch 1, accumulation 16, one epoch, gradient checkpointing, and paged AdamW 8-bit.
+- Train rank 16, alpha 32, dropout 0.05, learning rate `1e-4`, cosine schedule, 3% warmup,
+  micro-batch 1, accumulation 16, one epoch, gradient checkpointing, and fused AdamW.
 - Evaluate and save every 50 optimizer steps, retain the lowest-validation-loss checkpoint,
   and write into `artifacts/training/qwen3.5-4b-r16`.
 - `train --smoke` uses the 20 longest train/validation examples, performs one optimizer step,
@@ -60,7 +64,8 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 - Render prompt and full conversation separately, require an exact token prefix, and train
   only on the final assistant target. Never right-truncate a complete example.
 - Reject empty targets, oversized targets, sequence overflow, and template-prefix mismatch.
-- Compare the base model, every checkpoint, and `adapter-final` on delayed recall,
+- Compare the base model with `adapter-final`, or the Trainer-selected lowest-validation-loss
+  checkpoint while training is incomplete, on delayed recall,
   corrected state, persistent instructions, general reasoning, multilingual questions,
   relationship conditioning, and reply style.
 - Test 256/512/768/1K/2K/3K/4K training distances and 2K/4K/8K inference distances.
@@ -76,8 +81,8 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 - Training and inference use the same system prompt, chat template, relationship code, and
   `enable_thinking=False` behavior.
 - Budget live prompts to 8K tokens by dropping oldest complete turns first.
-- Prefer text-only serving for later deployment so the frozen vision encoder does not use
-  serving memory.
+- Keep the official multimodal loader at inference so vision can be added later; this
+  text-personality adapter changes language layers only and leaves the vision encoder intact.
 
 ## Required commands
 
@@ -88,8 +93,8 @@ personal-ai train --fresh
 personal-ai evaluate
 ```
 
-Human reviewers complete `data/processed/evaluation/blind_style_review.json`, then record
-adapter win totals in `data/processed/style_ratings.json` and rerun evaluation.
+Human reviewers complete `data/processed/evaluation/blind_style_review.json` and rerun
+evaluation. Choices are retained and counted only when the generated comparison is unchanged.
 
 ## Acceptance checklist
 

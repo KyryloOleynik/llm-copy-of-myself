@@ -62,13 +62,15 @@ def media_placeholder(message: dict[str, Any]) -> str:
 
 
 def merge_turns(messages: Iterable[dict[str, Any]], owner_id: str) -> list[dict[str, Any]]:
-    """Merge consecutive messages from the same side and preserve media markers."""
+    """Merge turns while never teaching the assistant to emit media placeholders."""
     turns: list[dict[str, Any]] = []
     for message in messages:
         text = message_text(message)
-        is_media_only = not bool(text)
-        content = text or media_placeholder(message)
         role = "assistant" if message.get("from_id") == owner_id else "user"
+        is_media_only = not bool(text)
+        if role == "assistant" and is_media_only:
+            continue
+        content = text if role == "assistant" else (text or media_placeholder(message))
         item = {
             "role": role,
             "content": content,
@@ -125,8 +127,9 @@ def _fit_example(
     target: dict[str, Any],
     max_length: int,
     max_target_tokens: int,
+    max_context_messages: int,
 ) -> tuple[list[dict[str, str]], int, int] | None:
-    context = list(context)
+    context = list(context)[-max_context_messages:]
     # Avoid rendering an arbitrarily long Telegram session only to discard its
     # oldest turns. This conservative content-only estimate bounds the first
     # real chat-template render; the exact loop below remains authoritative.
@@ -186,6 +189,7 @@ def _build_session_examples(
             target,
             config.model.sequence_length,
             config.data.max_target_tokens,
+            config.data.max_personal_context_messages,
         )
         if fitted is None:
             exclusions["target_too_long_or_context_cannot_fit"] += 1
@@ -219,6 +223,48 @@ def _deterministic_limit(
     return sorted(selected, key=lambda row: (row["timestamp"], row["example_id"]))
 
 
+def _balanced_chat_limit(
+    rows: list[dict[str, Any]], limit: int, seed: int
+) -> list[dict[str, Any]]:
+    """Keep the requested total while removing excess primarily from dominant chats."""
+    if len(rows) <= limit:
+        return rows
+    by_chat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_chat[row["chat_id"]].append(row)
+
+    low, high = 1, max(len(group) for group in by_chat.values())
+    while low < high:
+        cap = (low + high) // 2
+        if sum(min(len(group), cap) for group in by_chat.values()) >= limit:
+            high = cap
+        else:
+            low = cap + 1
+    cap = low
+    allocations = {chat_id: min(len(group), cap - 1) for chat_id, group in by_chat.items()}
+    remaining = limit - sum(allocations.values())
+    eligible = sorted(
+        (chat_id for chat_id, group in by_chat.items() if len(group) >= cap),
+        key=lambda chat_id: random.Random(f"{seed}:chat-allocation:{chat_id}").random(),
+    )
+    for chat_id in eligible[:remaining]:
+        allocations[chat_id] += 1
+
+    selected: list[dict[str, Any]] = []
+    for chat_id, group in sorted(by_chat.items()):
+        selected.extend(
+            _deterministic_limit(
+                group,
+                allocations[chat_id],
+                seed,
+                f"train:personal-chat:{chat_id}",
+            )
+        )
+    if len(selected) != limit:
+        raise RuntimeError(f"Balanced personal selection produced {len(selected)} rows, not {limit}")
+    return sorted(selected, key=lambda row: (row["timestamp"], row["example_id"]))
+
+
 def _balance_split(
     rows: list[dict[str, Any]], tokenizer: Any, config: AppConfig, split: str
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
@@ -242,20 +288,6 @@ def _balance_split(
         exclusions["duplicate_short_target_cap"] += len(group) - len(kept)
         retained.extend(kept)
 
-    if split == "train":
-        by_chat: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in retained:
-            by_chat[row["chat_id"]].append(row)
-        retained = []
-        for chat_id, group in sorted(by_chat.items()):
-            kept = _deterministic_limit(
-                group,
-                config.data.max_examples_per_chat,
-                config.training.seed,
-                f"{split}:chat:{chat_id}",
-            )
-            exclusions["per_chat_cap"] += len(group) - len(kept)
-            retained.extend(kept)
     retained.sort(key=lambda row: (row["timestamp"], row["example_id"]))
     return retained, exclusions
 
@@ -284,6 +316,9 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         if chat.get("type") != "personal_chat":
             exclusions["non_personal_chat"] += 1
             continue
+        if chat.get("relationship", "unknown") == "unknown":
+            exclusions["unknown_relationship_chat"] += 1
+            continue
         allocated = split_dataset_sessions(
             chat.get("sessions", []),
             config.data.train_ratio,
@@ -307,6 +342,18 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
     for split in splits:
         splits[split], balancing = _balance_split(splits[split], tokenizer, config, split)
         exclusions.update(balancing)
+        if split == "train":
+            available = len(splits[split])
+            requested = config.data.personal_train_examples
+            if available < requested:
+                raise ValueError(
+                    f"Only {available} personal training examples are available; "
+                    f"{requested} were requested"
+                )
+            splits[split] = _balanced_chat_limit(
+                splits[split], requested, config.training.seed
+            )
+            exclusions["personal_train_global_limit"] += available - requested
         personal_count = len(splits[split])
         for category, ratio in (
             ("context_retention", config.data.context_retention_ratio),

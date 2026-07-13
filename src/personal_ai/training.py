@@ -3,6 +3,7 @@ from __future__ import annotations
 import platform
 import re
 import shutil
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +45,38 @@ def _latest_valid_checkpoint(output_dir: Path) -> Path | None:
         if _checkpoint_is_resumable(path):
             return path
     return None
+
+
+def _clear_previous_run(output_dir: Path, *, smoke: bool) -> None:
+    """Remove stale adapters/checkpoints without deleting the full run's smoke gate."""
+    if smoke:
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        return
+    for path in output_dir.glob("checkpoint-*"):
+        if path.is_dir():
+            shutil.rmtree(path)
+    for name in ("adapter-final", ".interrupt-checkpoint-staging"):
+        path = output_dir / name
+        if path.is_dir():
+            shutil.rmtree(path)
+    metadata = output_dir / "reproducibility.json"
+    if metadata.is_file():
+        metadata.unlink()
+
+
+def _require_resume_dataset_match(output_dir: Path, dataset_sha256: str) -> None:
+    metadata_path = output_dir / "reproducibility.json"
+    if not metadata_path.is_file():
+        raise RuntimeError(
+            "A checkpoint exists without reproducibility metadata; use --fresh to avoid "
+            "mixing training runs"
+        )
+    previous_hash = read_json(metadata_path).get("dataset_sha256")
+    if previous_hash != dataset_sha256:
+        raise RuntimeError(
+            "Existing checkpoints were trained on a different dataset; rerun with --fresh"
+        )
 
 
 def _save_interrupted_checkpoint(trainer: Any, tokenizer: Any, output_dir: Path) -> Path:
@@ -220,6 +253,17 @@ def training_argument_overrides(smoke: bool) -> dict[str, Any]:
     }
 
 
+def warmup_steps(config: AppConfig, train_examples: int, smoke: bool) -> int:
+    """Convert the configured ratio to explicit optimizer steps for Transformers 5."""
+    if smoke:
+        return 0
+    micro_batches = math.ceil(train_examples / config.training.micro_batch_size)
+    optimizer_steps = math.ceil(
+        micro_batches * config.training.epochs / config.training.gradient_accumulation_steps
+    )
+    return math.ceil(optimizer_steps * config.training.warmup_ratio)
+
+
 def train(
     config: AppConfig,
     smoke: bool = False,
@@ -245,9 +289,11 @@ def train(
         require_successful_smoke(config, manifest["dataset_sha256"])
     set_seed(config.training.seed)
     output_dir = experiment_dir / "smoke" if smoke else experiment_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
     if fresh and resume is not None:
         raise ValueError("Use either --fresh or --resume, not both")
+    if fresh:
+        _clear_previous_run(output_dir, smoke=smoke)
+    output_dir.mkdir(parents=True, exist_ok=True)
     last_checkpoint_path = _latest_valid_checkpoint(output_dir)
     last_checkpoint = str(last_checkpoint_path) if last_checkpoint_path else None
     if resume == "last":
@@ -258,6 +304,8 @@ def train(
         resume = last_checkpoint
         if resume is not None:
             print(f"Automatically resuming from {resume}")
+    if resume is not None:
+        _require_resume_dataset_match(output_dir, manifest["dataset_sha256"])
     data_files = {
         "train": str(config.data.output_dir / "train.jsonl"),
         "validation": str(config.data.output_dir / "validation.jsonl"),
@@ -272,6 +320,8 @@ def train(
     tokenizer = load_tokenizer(config.model.base_model)
     model = load_quantized_base(config.model.base_model, torch, {"": 0})
     model.config.use_cache = False
+    if hasattr(model.config, "text_config"):
+        model.config.text_config.use_cache = False
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=config.training.gradient_checkpointing
     )
@@ -303,18 +353,22 @@ def train(
         learning_rate=config.training.learning_rate,
         num_train_epochs=config.training.epochs,
         max_steps=1 if smoke else -1,
-        warmup_ratio=config.training.warmup_ratio,
+        warmup_steps=warmup_steps(config, len(dataset["train"]), smoke),
         lr_scheduler_type=config.training.lr_scheduler_type,
         bf16=True,
         tf32=True,
         gradient_checkpointing=config.training.gradient_checkpointing,
+        dataloader_num_workers=2,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        dataloader_prefetch_factor=4,
         logging_steps=config.training.logging_steps,
         save_steps=config.training.save_steps,
         eval_steps=config.training.eval_steps,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=2,
-        optim="paged_adamw_8bit",
+        optim="adamw_torch_fused",
         report_to="none",
         seed=config.training.seed,
         data_seed=config.training.seed,
