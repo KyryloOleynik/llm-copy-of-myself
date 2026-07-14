@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from personal_ai.data import (
     _balanced_chat_limit,
+    _fit_example,
     merge_turns,
     prepare_dataset,
     split_dataset_sessions,
@@ -55,6 +56,43 @@ def test_long_assistant_message_does_not_drop_session():
     )
     assert len(turns) == 3
     assert len(turns[1]["content"]) == 1000
+
+
+def test_context_that_cannot_fit_is_marked_for_token_level_truncation():
+    tokenizer = FakeTokenizer()
+    system = {"role": "system", "content": "style"}
+    context = [
+        {
+            "role": "user",
+            "content": "x" * 100,
+            "source_message_ids": [1],
+            "last_message_date": "2026-01-01T00:00:00",
+            "media_only": False,
+        }
+    ]
+    target = {
+        "role": "assistant",
+        "content": "complete reply",
+        "source_message_ids": [2],
+        "last_message_date": "2026-01-01T00:01:00",
+        "media_only": False,
+    }
+
+    fitted = _fit_example(
+        tokenizer,
+        system,
+        context,
+        target,
+        max_length=64,
+        max_target_tokens=32,
+    )
+
+    assert fitted is not None
+    messages, sequence_tokens, target_tokens, truncated_prompt_tokens = fitted
+    assert sequence_tokens == 64
+    assert target_tokens > 0
+    assert truncated_prompt_tokens > 0
+    assert messages[-1] == {"role": "assistant", "content": "complete reply"}
 
 
 def test_media_is_preserved_and_marked_media_only():

@@ -12,10 +12,38 @@ from typing import Any
 
 from personal_ai.config import AppConfig
 from personal_ai.modeling import load_quantized_base, load_tokenizer, select_language_lora_modules
-from personal_ai.utils import assistant_target_ids, iter_jsonl, read_json, write_json
+from personal_ai.utils import assistant_target_ids, iter_jsonl, read_json, render_chat_ids, write_json
 
 
 IGNORE_INDEX = -100
+
+
+def truncate_prompt_tokens(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    prompt_ids: list[int],
+    target_ids: list[int],
+    max_length: int,
+) -> tuple[list[int], int, str]:
+    """Fit prompt+target while preserving the target and, when possible, the system prompt."""
+    prompt_budget = max_length - len(target_ids)
+    if prompt_budget < 1:
+        raise ValueError(
+            "Assistant target leaves no prompt tokens inside the configured "
+            f"{max_length}-token sequence"
+        )
+    if len(prompt_ids) <= prompt_budget:
+        return prompt_ids, 0, "none"
+
+    if messages and messages[0]["role"] == "system":
+        system_ids = render_chat_ids(tokenizer, messages[:1], generation=False)
+        if prompt_ids[: len(system_ids)] == system_ids and len(system_ids) < prompt_budget:
+            recent_budget = prompt_budget - len(system_ids)
+            truncated = system_ids + prompt_ids[-recent_budget:]
+            return truncated, len(prompt_ids) - len(truncated), "preserve_system_and_recent_tail"
+
+    truncated = prompt_ids[-prompt_budget:]
+    return truncated, len(prompt_ids) - len(truncated), "keep_recent_prompt_tail"
 
 
 def _checkpoint_is_resumable(path: Path) -> bool:
@@ -115,12 +143,25 @@ class ReplyOnlyCollator:
     tokenizer: Any
     max_length: int
     max_target_tokens: int = 256
+    capture_examples: bool = False
     audit: Counter[str] = field(default_factory=Counter)
+    captured_examples: list[dict[str, Any]] = field(default_factory=list)
+    backward_capture_ids: list[int] = field(default_factory=list)
+
+    def mark_used_for_backward(self, capture_ids: list[int]) -> None:
+        """Mark only batches whose Trainer training_step completed backward successfully."""
+        for capture_id in capture_ids:
+            record = self.captured_examples[capture_id]
+            if "backward_order" in record:
+                raise RuntimeError(f"Smoke audit capture {capture_id} was used more than once")
+            record["backward_order"] = len(self.backward_capture_ids) + 1
+            self.backward_capture_ids.append(capture_id)
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         import torch
 
         encoded_examples = []
+        pending_captures: list[dict[str, Any]] = []
         for example in examples:
             messages = example["messages"]
             try:
@@ -137,14 +178,50 @@ class ReplyOnlyCollator:
                     f"Assistant target has {len(target_ids)} tokens; "
                     f"maximum is {self.max_target_tokens}"
                 )
+            original_sequence_tokens = len(full_ids)
+            truncation_strategy = "none"
+            truncated_prompt_tokens = 0
             if len(full_ids) > self.max_length:
-                self.audit["sequence_overflow"] += 1
-                raise ValueError(
-                    f"Prepared example has {len(full_ids)} tokens; maximum is {self.max_length}"
-                )
+                try:
+                    prompt_ids, truncated_prompt_tokens, truncation_strategy = (
+                        truncate_prompt_tokens(
+                            self.tokenizer,
+                            messages,
+                            prompt_ids,
+                            target_ids,
+                            self.max_length,
+                        )
+                    )
+                except ValueError:
+                    self.audit["target_cannot_fit"] += 1
+                    raise
+                full_ids = prompt_ids + target_ids
+                self.audit["truncated_examples"] += 1
+                self.audit["truncated_prompt_tokens"] += truncated_prompt_tokens
             labels = [IGNORE_INDEX] * len(prompt_ids) + target_ids
             self.audit["examples"] += 1
             self.audit["target_tokens"] += len(target_ids)
+            if self.capture_examples:
+                pending_captures.append(
+                    {
+                        "collation_order": len(self.captured_examples) + len(pending_captures) + 1,
+                        "example_id": str(example.get("example_id", "")),
+                        "chat_id": str(example.get("chat_id", "")),
+                        "session_id": str(example.get("session_id", "")),
+                        "source_type": str(example.get("source_type", "")),
+                        "relationship": str(example.get("relationship", "")),
+                        "split": str(example.get("split", "")),
+                        "timestamp": str(example.get("timestamp", "")),
+                        "masked_prompt_messages": messages[:-1],
+                        "expected_assistant_reply": messages[-1]["content"],
+                        "masked_prompt_tokens": len(prompt_ids),
+                        "trained_target_tokens": len(target_ids),
+                        "total_sequence_tokens": len(full_ids),
+                        "original_sequence_tokens": original_sequence_tokens,
+                        "prompt_tokens_truncated": truncated_prompt_tokens,
+                        "prompt_truncation_strategy": truncation_strategy,
+                    }
+                )
             encoded_examples.append({"input_ids": full_ids, "labels": labels})
 
         max_len = max(len(row["input_ids"]) for row in encoded_examples)
@@ -155,11 +232,28 @@ class ReplyOnlyCollator:
             input_ids.append(row["input_ids"] + [pad_id] * padding)
             labels.append(row["labels"] + [IGNORE_INDEX] * padding)
             attention_mask.append([1] * len(row["input_ids"]) + [0] * padding)
-        return {
+        capture_ids: list[int] = []
+        if self.capture_examples:
+            for record, row_input_ids, row_labels, row_attention_mask in zip(
+                pending_captures, input_ids, labels, attention_mask, strict=True
+            ):
+                # Capture the same fully padded arrays returned to Trainer below.
+                # Nothing in this record is reconstructed after the smoke run.
+                record["padding_tokens"] = row_attention_mask.count(0)
+                record["input_ids"] = list(row_input_ids)
+                record["training_labels"] = list(row_labels)
+                record["attention_mask"] = list(row_attention_mask)
+                record["capture_id"] = len(self.captured_examples)
+                self.captured_examples.append(record)
+                capture_ids.append(record["capture_id"])
+        batch = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
+        if self.capture_examples:
+            batch["smoke_audit_capture_ids"] = torch.tensor(capture_ids, dtype=torch.long)
+        return batch
 
 
 def validate_prepared_dataset(config: AppConfig) -> dict[str, Any]:
@@ -215,6 +309,97 @@ def longest_example_indices(dataset_split: Any, limit: int) -> list[int]:
     return sorted(range(len(lengths)), key=lambda index: (-lengths[index], index))[:limit]
 
 
+def _smoke_pool_record(example: dict[str, Any]) -> dict[str, Any]:
+    """Return the readable prompt/target boundary for one selected smoke example."""
+    messages = example["messages"]
+    return {
+        "example_id": str(example.get("example_id", "")),
+        "chat_id": str(example.get("chat_id", "")),
+        "session_id": str(example.get("session_id", "")),
+        "source_type": str(example.get("source_type", "")),
+        "relationship": str(example.get("relationship", "")),
+        "split": str(example.get("split", "")),
+        "timestamp": str(example.get("timestamp", "")),
+        "sequence_tokens": int(example["sequence_tokens"]),
+        "target_tokens": int(example["target_tokens"]),
+        "masked_prompt_messages": messages[:-1],
+        "expected_assistant_reply": messages[-1]["content"],
+    }
+
+
+def write_smoke_sample_audit(
+    path: Path,
+    config: AppConfig,
+    manifest: dict[str, Any],
+    selected_train: Any,
+    selected_validation: Any,
+    collator: ReplyOnlyCollator,
+    status: str,
+) -> None:
+    """Write the selected pool and exact examples collated into a smoke training step."""
+    used_for_backward = sorted(
+        (record for record in collator.captured_examples if "backward_order" in record),
+        key=lambda record: record["backward_order"],
+    )
+    collated_lookahead = [
+        record for record in collator.captured_examples if "backward_order" not in record
+    ]
+    write_json(
+        path,
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "contains_unredacted_private_data": True,
+            "warning": "This audit contains private conversation text and must remain private.",
+            "model": config.model.base_model,
+            "dataset_sha256": manifest["dataset_sha256"],
+            "selection_rule": "20 longest prepared examples per available split",
+            "training_plan": {
+                "optimizer_steps": 1,
+                "micro_batch_size": config.training.micro_batch_size,
+                "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+            },
+            "loss_masking": {
+                "algorithm_source": (
+                    "ReplyOnlyCollator captures the exact tensors returned to Trainer. "
+                    "SmokeAuditTrainer marks a capture as actually_used_for_backward only "
+                    "after Trainer.training_step completes its backward call successfully."
+                ),
+                "ignored": (
+                    "All tokens rendered from masked_prompt_messages have label -100 and "
+                    "do not contribute to loss. If a sequence exceeds the configured limit, "
+                    "old prompt context is removed while preserving the system prompt when "
+                    "possible and retaining the newest prompt tail."
+                ),
+                "trained": (
+                    "Every token belonging to expected_assistant_reply is preserved, retains "
+                    "its token label, and contributes to loss."
+                ),
+                "verification": (
+                    "Training rejects the example unless the rendered prompt is an exact "
+                    "token prefix of the complete conversation."
+                ),
+                "raw_arrays": (
+                    "For each actually collated sample, training_labels is the exact label "
+                    "array sent to Trainer after batch padding: -100 entries are ignored; "
+                    "non-padding entries after masked_prompt_tokens are target token IDs "
+                    "and must equal input_ids at the same positions. attention_mask marks "
+                    "real tokens with 1 and padding with 0."
+                ),
+            },
+            "selected_training_pool": [
+                _smoke_pool_record(example) for example in selected_train
+            ],
+            "selected_validation_pool_not_trained": [
+                _smoke_pool_record(example) for example in selected_validation
+            ],
+            "actually_used_for_backward": used_for_backward,
+            "collated_lookahead_not_used_for_backward": collated_lookahead,
+        },
+        sort_keys=False,
+    )
+
+
 def prepared_dataset_features() -> Any:
     """Return a stable schema instead of relying on JSON shard type inference."""
     from datasets import Features, List, Value
@@ -250,6 +435,11 @@ def training_argument_overrides(smoke: bool) -> dict[str, Any]:
         "load_best_model_at_end": not smoke,
         "prediction_loss_only": True,
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        # Keep collation in the main process during smoke training so the audit
+        # records the exact examples delivered to the one optimizer step.
+        "dataloader_num_workers": 0 if smoke else 2,
+        "dataloader_persistent_workers": not smoke,
+        "dataloader_prefetch_factor": None if smoke else 4,
     }
 
 
@@ -358,10 +548,7 @@ def train(
         bf16=True,
         tf32=True,
         gradient_checkpointing=config.training.gradient_checkpointing,
-        dataloader_num_workers=2,
         dataloader_pin_memory=True,
-        dataloader_persistent_workers=True,
-        dataloader_prefetch_factor=4,
         logging_steps=config.training.logging_steps,
         save_steps=config.training.save_steps,
         eval_steps=config.training.eval_steps,
@@ -375,14 +562,32 @@ def train(
         remove_unused_columns=False,
         **training_argument_overrides(smoke),
     )
-    trainer = Trainer(
+    collator = ReplyOnlyCollator(
+        tokenizer,
+        config.model.sequence_length,
+        config.data.max_target_tokens,
+        capture_examples=smoke,
+    )
+    class SmokeAuditTrainer(Trainer):
+        def training_step(
+            self,
+            training_model: Any,
+            inputs: dict[str, Any],
+            num_items_in_batch: Any = None,
+        ) -> Any:
+            capture_ids = inputs.pop("smoke_audit_capture_ids", None)
+            loss = super().training_step(training_model, inputs, num_items_in_batch)
+            if capture_ids is not None:
+                collator.mark_used_for_backward(capture_ids.detach().cpu().tolist())
+            return loss
+
+    trainer_class = SmokeAuditTrainer if smoke else Trainer
+    trainer = trainer_class(
         model=model,
         args=args,
         train_dataset=dataset["train"],
         eval_dataset=None if smoke else dataset["validation"],
-        data_collator=ReplyOnlyCollator(
-            tokenizer, config.model.sequence_length, config.data.max_target_tokens
-        ),
+        data_collator=collator,
     )
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -399,10 +604,24 @@ def train(
         "trainable_parameter_names": trainable_names,
     }
     write_json(output_dir / "reproducibility.json", metadata)
+    smoke_audit_path = experiment_dir / "smoke-samples.json"
+    smoke_status = "prepared"
+    if smoke:
+        write_smoke_sample_audit(
+            smoke_audit_path,
+            config,
+            manifest,
+            dataset["train"],
+            dataset["validation"],
+            collator,
+            smoke_status,
+        )
     try:
         torch.cuda.reset_peak_memory_stats()
         trainer.train(resume_from_checkpoint=resume or None)
+        smoke_status = "completed"
     except KeyboardInterrupt:
+        smoke_status = "interrupted"
         # A normal Trainer save includes the adapter, optimizer, scheduler, RNG,
         # and trainer state, so this checkpoint can be resumed rather than merely
         # used for inference. Ctrl+C may take a moment to reach this handler while
@@ -414,6 +633,20 @@ def train(
             "Resume with: personal-ai train --resume last"
         )
         return
+    except Exception:
+        smoke_status = "failed"
+        raise
+    finally:
+        if smoke:
+            write_smoke_sample_audit(
+                smoke_audit_path,
+                config,
+                manifest,
+                dataset["train"],
+                dataset["validation"],
+                collator,
+                smoke_status,
+            )
     metadata["peak_vram_allocated_bytes"] = torch.cuda.max_memory_allocated()
     metadata["peak_vram_reserved_bytes"] = torch.cuda.max_memory_reserved()
     write_json(output_dir / "reproducibility.json", metadata)

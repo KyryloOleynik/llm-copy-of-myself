@@ -31,6 +31,16 @@ The smoke test runs one worst-case optimizer step without evaluation or periodic
 checkpointing. Full validation uses a per-device batch size of one because Qwen3.5's
 full-vocabulary loss can otherwise require several additional GiB of VRAM.
 
+Every smoke run also writes `artifacts/training/qwen3.5-4b-r16/smoke-samples.json`.
+It lists the 20 longest selected examples, the exact examples actually collated into
+the optimizer step, the prompt messages masked out of the loss, and the final assistant
+reply that the model was trained to generate. Its `input_ids` and `training_labels` are
+captured inside the exact same collator call that feeds Trainer, rather than being
+reconstructed later by separate audit logic. Samples are moved to
+`actually_used_for_backward` only after Trainer completes backward successfully;
+Accelerate's one-batch look-ahead is listed separately and is not reported as trained.
+This file contains unredacted private conversation text and must remain private.
+
 The Windows environment includes Triton and FLA and bridges FLA's current convolution
 API to the API expected by the pinned Transformers Qwen3.5 implementation. If startup
 reports that fast kernels are unavailable, stop the run and reinstall this requirements
@@ -87,7 +97,11 @@ prevents checkpoints from different prepared-dataset hashes from being mixed.
 
 The trainer refuses to run without CUDA or BF16 support. It uses 4-bit NF4,
 double quantization, BF16 compute, Qwen3.5 language token-mixer plus MLP LoRA modules,
-and masks every token except the final assistant reply. The vision encoder is
+and masks every token except the final assistant reply. Samples over the configured
+sequence length discard old prompt context while preserving the relationship/system
+prompt when possible and retaining the newest prompt tail. The complete final assistant
+reply is always preserved, and a target that cannot fit is rejected.
+The vision encoder is
 frozen and excluded from LoRA. Watch VRAM with `nvidia-smi`; the 12 GiB acceptance
 limit must be verified on the target PC and is recorded in `reproducibility.json`.
 

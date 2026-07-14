@@ -126,6 +126,9 @@ def test_smoke_disables_evaluation_and_periodic_saves():
     assert options["save_strategy"] == "no"
     assert options["load_best_model_at_end"] is False
     assert options["prediction_loss_only"] is True
+    assert options["dataloader_num_workers"] == 0
+    assert options["dataloader_persistent_workers"] is False
+    assert options["dataloader_prefetch_factor"] is None
 
 
 def test_full_training_uses_memory_safe_evaluation():
@@ -136,6 +139,9 @@ def test_full_training_uses_memory_safe_evaluation():
     assert options["save_strategy"] == "steps"
     assert options["load_best_model_at_end"] is True
     assert options["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
+    assert options["dataloader_num_workers"] == 2
+    assert options["dataloader_persistent_workers"] is True
+    assert options["dataloader_prefetch_factor"] == 4
 
 
 def test_warmup_ratio_is_converted_to_optimizer_steps():
