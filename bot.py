@@ -38,9 +38,12 @@ ENV_PATH = ROOT / ".env"
 load_dotenv(ENV_PATH)
 
 TOKEN = os.getenv("BOT_TOKEN")
-BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen3.5-4B")
+BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 ADAPTER_PATH = Path(
-    os.getenv("ADAPTER_PATH", str(ROOT / "artifacts/training/qwen3.5-4b-r16/adapter-final"))
+    os.getenv(
+        "ADAPTER_PATH",
+        str(ROOT / "artifacts/training/qwen3-4b-instruct-2507-r16/adapter-final"),
+    )
 )
 MIN_REPLY_DELAY = float(os.getenv("MIN_REPLY_DELAY", "2"))
 MAX_REPLY_DELAY = float(os.getenv("MAX_REPLY_DELAY", "60"))
@@ -315,8 +318,8 @@ async def generation_worker() -> None:
             history.append({"role": "user", "content": request.incoming})
             prompt = [
                 {
-                    "role": "system",
                     "content": relationship_system_message(request.relationship),
+                    "role": "system",
                 },
                 *history[-MAX_HISTORY_TURNS * 2 :],
             ]

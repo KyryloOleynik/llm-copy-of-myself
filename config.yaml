@@ -20,17 +20,17 @@ data:
   instruction_following_ratio: 0.04
 
 model:
-  base_model: Qwen/Qwen3.5-4B
+  base_model: Qwen/Qwen3-4B-Instruct-2507
   sequence_length: 1024
   thinking_enabled: false
 
 training:
   method: qlora
-  output_dir: artifacts/training/qwen3.5-4b-r16
+  output_dir: artifacts/training/qwen3-4b-instruct-2507-r16
   lora_rank: 16
   lora_alpha: 32
   lora_dropout: 0.05
-  learning_rate: 0.0001
+  learning_rate: 0.0002
   micro_batch_size: 1
   gradient_accumulation_steps: 16
   epochs: 1
@@ -41,7 +41,7 @@ training:
   eval_steps: 50
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
-  lora_target_policy: language-token-mixers-and-mlp
+  lora_target_policy: attention-and-mlp
   seed: 42
 
 retrieval:

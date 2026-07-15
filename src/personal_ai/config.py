@@ -71,11 +71,11 @@ class ModelConfig(StrictModel):
 
 class TrainingConfig(StrictModel):
     method: str = "qlora"
-    output_dir: Path = Path("artifacts/training/qwen3.5-4b-r16")
+    output_dir: Path = Path("artifacts/training/qwen3-4b-instruct-2507-r16")
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-4
     micro_batch_size: int = 1
     gradient_accumulation_steps: int = 16
     epochs: float = 1
@@ -85,17 +85,15 @@ class TrainingConfig(StrictModel):
     eval_steps: int = 50
     warmup_ratio: float = Field(0.03, ge=0, lt=1)
     lr_scheduler_type: str = "cosine"
-    lora_target_policy: str = "language-token-mixers-and-mlp"
+    lora_target_policy: str = "attention-and-mlp"
     seed: int = 42
 
     @model_validator(mode="after")
     def validate_policy(self) -> "TrainingConfig":
         if self.method != "qlora":
             raise ValueError("Only training.method: qlora is supported on the 12 GiB target")
-        if self.lora_target_policy != "language-token-mixers-and-mlp":
-            raise ValueError(
-                "Only lora_target_policy: language-token-mixers-and-mlp is supported"
-            )
+        if self.lora_target_policy != "attention-and-mlp":
+            raise ValueError("Only lora_target_policy: attention-and-mlp is supported")
         if self.save_steps % self.eval_steps != 0:
             raise ValueError("save_steps must be a multiple of eval_steps")
         return self

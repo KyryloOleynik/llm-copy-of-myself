@@ -127,7 +127,7 @@ def _fit_example(
     target: dict[str, Any],
     max_length: int,
     max_target_tokens: int,
-) -> tuple[list[dict[str, str]], int, int] | None:
+) -> tuple[list[dict[str, str]], int, int, int] | None:
     context = list(context)
     # Avoid rendering an arbitrarily long Telegram session only to discard its
     # oldest turns. This conservative content-only estimate bounds the first
@@ -149,12 +149,21 @@ def _fit_example(
     while context and any(turn["role"] == "user" for turn in context):
         prompt = [system] + [{"role": turn["role"], "content": turn["content"]} for turn in context]
         messages = prompt + [{"role": "assistant", "content": target["content"]}]
-        _, full_ids, target_ids = assistant_target_ids(tokenizer, messages)
+        prompt_ids, full_ids, target_ids = assistant_target_ids(tokenizer, messages)
         target_count = len(target_ids)
         if target_count > max_target_tokens:
             return None
         if len(full_ids) <= max_length:
-            return messages, len(full_ids), target_count
+            return messages, len(full_ids), target_count, 0
+        remaining_context = context[1:]
+        if not any(turn["role"] == "user" for turn in remaining_context):
+            overflow = len(full_ids) - max_length
+            if overflow >= len(prompt_ids):
+                return None
+            # Keep the readable messages intact in the dataset. ReplyOnlyCollator
+            # applies this exact left-side token truncation during training while
+            # preserving every final assistant target token.
+            return messages, max_length, target_count, overflow
         context.pop(0)
     return None
 
@@ -192,7 +201,10 @@ def _build_session_examples(
         if fitted is None:
             exclusions["target_too_long_or_context_cannot_fit"] += 1
             continue
-        messages, sequence_tokens, target_tokens = fitted
+        messages, sequence_tokens, target_tokens, truncated_prompt_tokens = fitted
+        if truncated_prompt_tokens:
+            exclusions["examples_with_token_level_prompt_truncation"] += 1
+            exclusions["prompt_tokens_truncated"] += truncated_prompt_tokens
         rows.append(
             {
                 "example_id": f"{session['session_id']}_reply_{index:04d}",

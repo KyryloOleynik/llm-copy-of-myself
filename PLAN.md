@@ -1,10 +1,10 @@
-# QLoRA Dataset Repair and Qwen3.5 Migration
+# QLoRA Dataset Repair and Qwen3-4B-Instruct-2507 Migration
 
 ## Goal
 
-Build a corrected personal-data baseline on `Qwen/Qwen3.5-4B` before adding retrieval,
-Calendar access, GGUF export, or wider Telegram deployment. Test 4,096-token training
-first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRAM requires it.
+Build a corrected personal-data baseline on `Qwen/Qwen3-4B-Instruct-2507` before adding
+retrieval, Calendar access, GGUF export, or wider Telegram deployment. Train at the
+validated 1,024-token limit on the Windows RTX 5070.
 
 ## Data pipeline
 
@@ -21,7 +21,7 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 - Add the shared relationship system prompt, preserve leading owner/assistant turns when
   they precede later user context, and store the session ID plus actual target timestamp.
 - Keep as much preceding personal-chat context as fits. Remove only the oldest complete
-  turns when the Qwen3.5 tokenizer reaches the 1,024-token hard limit; targets retain a
+  turns when the Qwen3 tokenizer reaches the 1,024-token hard limit; targets retain a
   separate 256-token limit. The context-retention replay set supplements these real chats.
 - With seed 42, retain exactly 5,779 personal training examples and cap identical targets
   of three tokens or fewer at 25 per relationship and split. When the global quota removes
@@ -38,22 +38,21 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 
 ## Training pipeline
 
-- Use `Qwen/Qwen3.5-4B` in non-thinking mode with the exact pinned Transformers commit.
+- Use the text-only `Qwen/Qwen3-4B-Instruct-2507` checkpoint with the exact pinned
+  Transformers commit. This checkpoint is permanently non-thinking.
 - Use QLoRA, not full-precision LoRA: the official `4B` name describes parameter count,
   while the source checkpoint is BF16. Quantize the frozen source weights to NF4 only when
   loading them for training, then train the LoRA adapter weights in higher precision. Revisit
   ordinary LoRA only if a measured 4,096-token smoke run proves the BF16 base fits below the
   12 GiB limit with sufficient headroom.
-- Load the official multimodal model in NF4 with double quantization and BF16 compute, but
-  freeze the vision encoder and select LoRA only on language token mixers:
-  `q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `in_proj_a`,
-  `in_proj_b`, and `out_proj`.
-- Fail before training when expected projections are absent, a vision parameter is
-  trainable, prepared artifacts do not match the configuration, or a session crosses splits.
-- Train rank 16, alpha 32, dropout 0.05, learning rate `1e-4`, cosine schedule, 3% warmup,
+- Load the causal language model in NF4 with double quantization and BF16 compute. Apply
+  LoRA to `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`.
+- Fail before training when expected projections are absent, prepared artifacts do not
+  match the configuration, or a session crosses splits.
+- Train rank 16, alpha 32, dropout 0.05, learning rate `2e-4`, cosine schedule, 3% warmup,
   micro-batch 1, accumulation 16, one epoch, gradient checkpointing, and fused AdamW.
 - Evaluate and save every 50 optimizer steps, retain the lowest-validation-loss checkpoint,
-  and write into `artifacts/training/qwen3.5-4b-r16`.
+  and write into `artifacts/training/qwen3-4b-instruct-2507-r16`.
 - `train --smoke` uses the 20 longest train/validation examples, performs one optimizer step,
   and records peak allocated and reserved VRAM. A full run is forbidden until the smoke
   test succeeds below 12 GiB on the RTX 5070.
@@ -62,7 +61,9 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 
 - Render prompt and full conversation separately, require an exact token prefix, and train
   only on the final assistant target. Never right-truncate a complete example.
-- Reject empty targets, oversized targets, sequence overflow, and template-prefix mismatch.
+- Reject empty or oversized targets and template-prefix mismatches. When a complete
+  sequence exceeds 1,024 tokens, remove old prompt context while preserving the entire
+  final assistant target.
 - Compare the base model with `adapter-final`, or the Trainer-selected lowest-validation-loss
   checkpoint while training is incomplete, on delayed recall,
   corrected state, persistent instructions, general reasoning, multilingual questions,
@@ -77,11 +78,9 @@ first on the Windows RTX 5070; fall back to 3,072, 2,048, then 1,024 only if VRA
 
 - Do not migrate the Telegram bot to a new adapter until `personal-ai evaluate` marks it
   accepted.
-- Training and inference use the same system prompt, chat template, relationship code, and
-  `enable_thinking=False` behavior.
+- Training and inference use the same system prompt, chat template, and relationship code.
 - Budget live prompts to 8K tokens by dropping oldest complete turns first.
-- Keep the official multimodal loader at inference so vision can be added later; this
-  text-personality adapter changes language layers only and leaves the vision encoder intact.
+- Keep the same text-only causal-LM loader for training, evaluation, and bot inference.
 
 ## Required commands
 
@@ -102,6 +101,6 @@ evaluation. Choices are retained and counted only when the generated comparison 
 - All examples begin with system, contain at least one user turn, preserve available leading
   owner context, and end with a non-empty assistant target.
 - No sequence or target exceeds its configured token budget.
-- No LoRA parameter belongs to the vision encoder.
+- Every LoRA parameter belongs to a Qwen3 attention or MLP projection.
 - The RTX 5070 smoke run completes below 12 GiB without CPU offload.
 - An adapter passes automatic context/reasoning gates and the 60% blind style gate.
