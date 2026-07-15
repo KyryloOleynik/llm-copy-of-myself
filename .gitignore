@@ -5,7 +5,14 @@ __pycache__/
 .vscode/
 .idea/
 .agents/
+.env
+.env.*
+!.env.example
+config.yaml
+DataExport_*/
+private_data/
 data/bot.sqlite3
+data/retrieval.sqlite3
 data/processed/
 artifacts/
 *.egg-info/
