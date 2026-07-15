@@ -1,95 +1,21 @@
 #!/usr/bin/env python3
-"""Clean a Telegram JSON export and split chats into training sessions."""
+"""Clean a Telegram JSON export and split personal chats into training sessions."""
 
+from __future__ import annotations
+
+import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 from personal_ai.utils import read_json, write_json
 
-
 SESSION_GAP_SECONDS = 12 * 60 * 60
 
-# Provisional English relationship labels inferred from the supplied category
-# list and conversation content. These are intentionally easy to review/edit.
-RELATIONSHIPS = {
-    "Папа": "family",
-    "Svik": "family",
-    "Mark": "close_friend",
-    "Дятел 2": "close_friend",
-    "Илья Крипта": "friend",
-    "Петя": "friend",
-    "Абсолютный": "friend",
-    "Воздух": "friend",
-    "Маруся": "friend",
-    "Конь": "acquaintance",
-    "Бонданка": "acquaintance",
-    "Is Is": "acquaintance",
-    "рыжий": "acquaintance",
-    "Саня": "acquaintance",
-    "Лёша": "acquaintance",
-    "Вадик": "acquaintance",
-    "Ди": "acquaintance",
-    "Саша": "acquaintance",
-    "#суета": "acquaintance",
-    "Даря": "acquaintance",
-    "Вика": "family",
-    "Timmurrka": "acquaintance",
-    "Евгений": "friend",
-    "Yurii": "friend",
-    "Женя": "friend",
-    "улег": "acquaintance",
-    "Павлик Морозов": "friend",
-    "Миша": "friend",
-    "тим": "friend",
-    "Xlebuhek11": "acquaintance",
-    "Вася": "acquaintance",
-    "машка": "acquaintance",
-    "Алина": "acquaintance",
-    "c": "acquaintance",
-    "_Vika_": "acquaintance",
-    "Husher_Vladislava": "acquaintance",
-    "Людмила": "family",
-    "milana": "acquaintance",
-    "###": "acquaintance",
-    "Аля<3": "acquaintance",
-    "Артур": "acquaintance",
-    "Dima Zhelezniak": "acquaintance",
-    "Dasha": "acquaintance",
-    "Англ": "professional_contact",
-    "hyoka": "acquaintance",
-    "хуй": "acquaintance",
-    "Наталія Миронюк": "professional_contact",
-    "+380 67 630 3742": "professional_contact",
-    "Саня айтишечка": "acquaintance",
-    "Кирюша сайт": "acquaintance",
-    "Сайт кент Красного": "professional_contact",
-    "продвижение Biokmedical": "professional_contact",
-    "Фотопик": "professional_contact",
-    "Перевод": "professional_contact",
-    "Кравченко Оксана": "professional_contact",
-    "Ольга Черниш": "professional_contact",
-    "Вікторія": "professional_contact",
-    "Ansty": "professional_contact",
-    "Vadym": "professional_contact",
-    "IQ200 Дніпро": "professional_contact",
-    "Шепотенко": "professional_contact",
-    "Secure Shop Support": "professional_contact",
-    "Incredible Store": "professional_contact",
-    "Friendly": "professional_contact",
-    "EntertainSubs": "professional_contact",
-    "🇸 🇮 🇲 🇨 🇦 🇷 🇩": "professional_contact",
-    "CompX": "professional_contact",
-    "ремонт шлем": "professional_contact",
-    "Олх": "professional_contact",
-    "RoM4iK": "professional_contact",
-    "A": "professional_contact",
-    "𝙰𝚗𝚍𝚛𝚎𝚎𝚟𝚊 𝙳𝚊𝚗𝚊": "acquaintance",
-}
 
-
-def clean_message(message):
-    """Return a cleaned message, or None when it should be excluded."""
+def clean_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a cleaned message, or ``None`` when it should be excluded."""
     if message.get("type") == "service":
         return None
 
@@ -97,8 +23,6 @@ def clean_message(message):
         emoji = message.get("sticker_emoji")
         if not emoji:
             return None
-
-        # Preserve conversational timing and authorship, but discard sticker files.
         return {
             key: value
             for key, value in message.items()
@@ -119,10 +43,11 @@ def clean_message(message):
     return deepcopy(message)
 
 
-def split_messages_into_sessions(messages):
-    sessions = []
-    current = []
-    previous_timestamp = None
+def split_messages_into_sessions(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split a chat whenever the gap between messages is greater than 12 hours."""
+    sessions: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    previous_timestamp: int | None = None
 
     for message in messages:
         timestamp = int(message["date_unixtime"])
@@ -138,8 +63,11 @@ def split_messages_into_sessions(messages):
     return sessions
 
 
-def clean_export(source):
-    output_chats = []
+def clean_export(
+    source: dict[str, Any], relationships: dict[str, str]
+) -> dict[str, Any]:
+    """Clean a Telegram desktop export without embedding personal labels in source code."""
+    output_chats: list[dict[str, Any]] = []
     stats = {
         "source_chats": len(source["chats"]["list"]),
         "saved_messages_chats_removed": 0,
@@ -160,7 +88,7 @@ def clean_export(source):
             stats["telegram_chats_removed"] += 1
             continue
 
-        cleaned_messages = []
+        cleaned_messages: list[dict[str, Any]] = []
         for original in chat.get("messages", []):
             if original.get("type") == "service":
                 stats["service_records_removed"] += 1
@@ -185,7 +113,7 @@ def clean_export(source):
                 "type": chat.get("type"),
                 "id": chat.get("id"),
                 "relationship": (
-                    RELATIONSHIPS.get(chat.get("name"), "unknown")
+                    relationships.get(str(chat.get("name")), "unknown")
                     if chat.get("type") == "personal_chat"
                     else "not_applicable"
                 ),
@@ -205,7 +133,6 @@ def clean_export(source):
 
     return {
         "cleaning_rules": {
-            "self_name": "Родион",
             "session_gap_hours": 12,
             "session_split_condition": "gap strictly greater than 12 hours",
             "service_records": "removed",
@@ -220,14 +147,26 @@ def clean_export(source):
     }
 
 
-def main():
-    project_dir = Path(__file__).resolve().parent
-    source_path = project_dir / "DataExport_2026-07-10" / "result.json"
-    output_path = project_dir / "DataExport_2026-07-10" / "cleaned_sessions.json"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, default=Path("private_data/result.json"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("private_data/cleaned_sessions.json")
+    )
+    parser.add_argument(
+        "--relationships",
+        type=Path,
+        default=Path("private_data/relationships.json"),
+        help="Private JSON mapping of Telegram chat names to relationship categories.",
+    )
+    return parser.parse_args()
 
-    cleaned = clean_export(read_json(source_path))
-    write_json(output_path, cleaned, sort_keys=False)
 
+def main() -> None:
+    args = parse_args()
+    relationships = read_json(args.relationships) if args.relationships.is_file() else {}
+    cleaned = clean_export(read_json(args.source), relationships)
+    write_json(args.output, cleaned, sort_keys=False)
     print(json.dumps(cleaned["stats"], ensure_ascii=False, indent=2))
 
 
