@@ -7,9 +7,8 @@ class FakeTokenizer:
         messages,
         tokenize,
         add_generation_prompt,
-        enable_thinking,
     ):
-        assert tokenize and enable_thinking is False
+        assert tokenize
         ids = []
         for message in messages:
             ids.append({"system": 10, "user": 20, "assistant": 30}[message["role"]])

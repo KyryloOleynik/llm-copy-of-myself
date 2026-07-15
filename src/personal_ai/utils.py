@@ -73,7 +73,6 @@ def render_chat_ids(
             messages,
             tokenize=True,
             add_generation_prompt=generation,
-            enable_thinking=False,
         )
     )
 

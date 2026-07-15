@@ -10,11 +10,6 @@ LANGUAGE_LORA_SUFFIXES = {
     "k_proj",
     "v_proj",
     "o_proj",
-    "in_proj_qkv",
-    "in_proj_z",
-    "in_proj_a",
-    "in_proj_b",
-    "out_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -44,7 +39,7 @@ def load_tokenizer(source: str | Path) -> Any:
 
 
 def load_quantized_base(model_name: str, torch: Any, device_map: Any) -> Any:
-    from transformers import AutoModelForMultimodalLM, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
     quantization = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -52,11 +47,12 @@ def load_quantized_base(model_name: str, torch: Any, device_map: Any) -> Any:
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
-    return AutoModelForMultimodalLM.from_pretrained(
+    return AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quantization,
         dtype=torch.bfloat16,
         device_map=device_map,
+        attn_implementation="sdpa",
         low_cpu_mem_usage=True,
     )
 
@@ -90,7 +86,6 @@ def generate_reply(
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
     )
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.inference_mode():
@@ -123,7 +118,6 @@ def generate_replies(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
         )
         for messages in conversations
     ]
@@ -153,7 +147,7 @@ def generate_replies(
 
 
 def select_language_lora_modules(model: Any) -> list[str]:
-    """Select Qwen3.5 language token-mixer and MLP paths, never vision modules."""
+    """Select the standard Qwen3 attention and MLP projections for LoRA."""
     selected: list[str] = []
     observed: Counter[str] = Counter()
     for name, module in model.named_modules():
@@ -161,13 +155,13 @@ def select_language_lora_modules(model: Any) -> list[str]:
         if suffix not in LANGUAGE_LORA_SUFFIXES or not hasattr(module, "weight"):
             continue
         lowered = name.casefold()
-        if "vision" in lowered or "visual" in lowered or "language_model" not in lowered:
+        if "vision" in lowered or "visual" in lowered or suffix == "lm_head":
             continue
         selected.append(name)
         observed[suffix] += 1
     missing = sorted(LANGUAGE_LORA_SUFFIXES - set(observed))
     if missing:
-        raise RuntimeError(f"Qwen3.5 language LoRA projections are missing: {missing}")
+        raise RuntimeError(f"Qwen3 attention/MLP LoRA projections are missing: {missing}")
     if not selected:
-        raise RuntimeError("No Qwen3.5 language-model LoRA modules were selected")
+        raise RuntimeError("No Qwen3 attention/MLP LoRA modules were selected")
     return selected

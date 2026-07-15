@@ -14,8 +14,8 @@ def test_only_final_reply_has_labels():
         {"role": "user", "content": "abc"},
         {"role": "assistant", "content": "xy"},
     ]
-    prompt = tokenizer.apply_chat_template(messages[:-1], True, True, False)
-    full = tokenizer.apply_chat_template(messages, True, False, False)
+    prompt = tokenizer.apply_chat_template(messages[:-1], True, True)
+    full = tokenizer.apply_chat_template(messages, True, False)
     collator = ReplyOnlyCollator(tokenizer, max_length=100)
     batch = collator([{"messages": messages}])
     labels = batch["labels"][0].tolist()
@@ -198,7 +198,7 @@ def test_overflow_preserves_system_prompt_and_recent_context_tail():
         {"role": "user", "content": "x" * 100},
         {"role": "assistant", "content": "ok"},
     ]
-    system_ids = tokenizer.apply_chat_template(messages[:1], True, False, False)
+    system_ids = tokenizer.apply_chat_template(messages[:1], True, False)
     _, _, target = assistant_target_ids(tokenizer, messages)
     collator = ReplyOnlyCollator(tokenizer, max_length=32, capture_examples=True)
 
@@ -244,10 +244,8 @@ def test_oversized_target_is_rejected():
 
 
 class NonPrefixTokenizer(FakeTokenizer):
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt, enable_thinking):
-        ids = super().apply_chat_template(
-            messages, tokenize, add_generation_prompt, enable_thinking
-        )
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+        ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
         if not add_generation_prompt:
             ids[0] = 999
         return ids
