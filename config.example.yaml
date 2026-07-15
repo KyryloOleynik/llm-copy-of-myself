@@ -1,0 +1,53 @@
+project:
+  name: personal-telegram-ai
+  owner_from_id: REPLACE_WITH_YOUR_TELEGRAM_FROM_ID
+
+data:
+  source: private_data/result.json
+  cleaned: private_data/cleaned_sessions.json
+  dataset: private_data/dataset.json
+  output_dir: data/processed
+  session_gap_hours: 12
+  train_ratio: 0.9
+  validation_ratio: 0.05
+  test_ratio: 0.05
+  max_target_tokens: 256
+  personal_train_examples: 1000
+  contains_unredacted_private_data: true
+  personal_data_ratio: 0.86
+  context_retention_ratio: 0.08
+  general_reasoning_ratio: 0.02
+  instruction_following_ratio: 0.04
+
+model:
+  base_model: Qwen/Qwen3-4B-Instruct-2507
+  sequence_length: 1024
+  thinking_enabled: false
+
+training:
+  method: qlora
+  output_dir: artifacts/training/qwen3-4b-instruct-2507-r16
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  learning_rate: 0.0002
+  micro_batch_size: 1
+  gradient_accumulation_steps: 16
+  epochs: 1
+  gradient_checkpointing: true
+  logging_steps: 5
+  save_steps: 50
+  eval_steps: 50
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  lora_target_policy: attention-and-mlp
+  seed: 42
+
+retrieval:
+  database: data/retrieval.sqlite3
+  context_limit: 8192
+
+bot:
+  polling: true
+  state_database: data/bot.sqlite3
+  model_server_url: http://127.0.0.1:8080/v1
