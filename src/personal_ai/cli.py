@@ -7,6 +7,18 @@ from personal_ai.config import load_config
 app = typer.Typer(no_args_is_help=True, help="Personal Telegram AI pipeline.")
 
 
+@app.command("authorize-calendar")
+def authorize_calendar(
+    credentials: Path = Path("private_data/google_calendar_credentials.json"),
+    token: Path = Path("private_data/google_calendar_token.json"),
+) -> None:
+    """Authorize read-only access to the owner's Google Calendar."""
+    from personal_ai.google_calendar import authorize_google_calendar
+
+    saved = authorize_google_calendar(credentials, token)
+    typer.echo(f"Google Calendar authorized: {saved}")
+
+
 @app.command("prepare-data")
 def prepare_data(config: Path = Path("config.yaml")) -> None:
     """Build tokenizer-budgeted train/validation/test data from complete sessions."""
@@ -17,6 +29,34 @@ def prepare_data(config: Path = Path("config.yaml")) -> None:
     tokenizer = load_tokenizer(app_config.model.base_model)
     manifest = prepare_dataset(app_config, tokenizer)
     typer.echo(f"Prepared dataset: {manifest['counts']}")
+
+
+@app.command("build-rag")
+def build_rag(config: Path = Path("config.yaml")) -> None:
+    """Index private knowledge files and cleaned Telegram sessions for local RAG."""
+    from personal_ai.retrieval import build_retrieval_index
+
+    stats = build_retrieval_index(load_config(config))
+    typer.echo(f"Built RAG index: {stats}")
+
+
+@app.command("search-rag")
+def search_rag(
+    query: str,
+    config: Path = Path("config.yaml"),
+) -> None:
+    """Search the private RAG index from the terminal."""
+    import json
+
+    from personal_ai.retrieval import search_retrieval
+
+    app_config = load_config(config)
+    results = search_retrieval(
+        app_config.retrieval.database,
+        query,
+        app_config.retrieval.max_results,
+    )
+    typer.echo(json.dumps(results, ensure_ascii=False, indent=2))
 
 
 @app.command()

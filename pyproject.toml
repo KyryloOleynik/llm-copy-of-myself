@@ -5,12 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "personal-telegram-ai"
 version = "0.1.0"
-description = "Local dataset, QLoRA training, evaluation, retrieval, and bot pipeline"
+description = "Local dataset, QLoRA training, private RAG, evaluation, and Telegram bot pipeline"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "google-api-python-client>=2.170,<3",
+  "google-auth-httplib2>=0.2,<1",
+  "google-auth-oauthlib>=1.2,<2",
   "Jinja2>=3.1,<4",
+  "numpy>=1.26,<3",
   "PyYAML>=6.0,<7",
   "pydantic>=2.10,<3",
+  "sentence-transformers>=5.1,<6",
   "typer>=0.15,<1",
 ]
 
@@ -19,7 +24,6 @@ train = [
   "accelerate>=1.2,<2",
   "bitsandbytes>=0.45,<1",
   "datasets>=3.2,<5",
-  "numpy>=1.26,<3",
   "peft>=0.14,<1",
   "safetensors>=0.5,<1",
   "transformers @ git+https://github.com/huggingface/transformers.git@4626421dc6b741a329300682a6408246ee465490",

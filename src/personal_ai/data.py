@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import random
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,9 +10,15 @@ from statistics import median
 from typing import Any, Iterable
 
 from personal_ai.config import AppConfig
-from personal_ai.supplemental import build_supplemental_examples
+from personal_ai.supplemental import (
+    build_additional_tool_example,
+    build_calendar_tool_examples,
+    build_supplemental_examples,
+)
 from personal_ai.utils import (
     assistant_target_ids,
+    assistant_target_text,
+    normalize_messages_for_storage,
     read_json,
     relationship_system_message,
     sha256_file,
@@ -217,7 +225,8 @@ def _build_session_examples(
                 "target_message_ids": target["source_message_ids"],
                 "sequence_tokens": sequence_tokens,
                 "target_tokens": target_tokens,
-                "messages": messages,
+                "messages": normalize_messages_for_storage(messages),
+                "tools": "[]",
             }
         )
     return rows
@@ -287,6 +296,93 @@ def _percentiles(values: list[int]) -> dict[str, int | float | None]:
     }
 
 
+def _personal_style_samples(rows: list[dict[str, Any]]) -> list[str]:
+    samples: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        content = str(row["messages"][-1].get("content") or "").strip()
+        if (
+            content
+            and len(content) <= 80
+            and len(content.split()) <= 10
+            and content not in seen
+        ):
+            seen.add(content)
+            samples.append(content)
+    return samples
+
+
+def _validate_synthetic_examples(rows: list[dict[str, Any]]) -> dict[str, int]:
+    synthetic = [row for row in rows if row["source_type"] != "personal_telegram"]
+    fingerprints: set[str] = set()
+    targets: set[str] = set()
+    persona_prefix = "Отвечай в стиле Родиона."
+    for row in synthetic:
+        messages = row["messages"]
+        if not messages or not messages[0]["content"].startswith(persona_prefix):
+            raise ValueError(f"{row['example_id']} does not preserve the owner persona prompt")
+        fingerprint = json.dumps(
+            {"messages": messages, "tools": row.get("tools", "[]")},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if fingerprint in fingerprints:
+            raise ValueError(f"Duplicate synthetic conversation: {row['example_id']}")
+        fingerprints.add(fingerprint)
+        target = assistant_target_text(messages).strip().casefold()
+        if not target or target in targets:
+            raise ValueError(f"Duplicate or empty synthetic target: {row['example_id']}")
+        targets.add(target)
+        if row["source_type"] in {"tool_calling", "rag_retrieval"}:
+            if not json.loads(row.get("tools", "[]")):
+                raise ValueError(f"{row['example_id']} is missing native tool definitions")
+            target_calls = json.loads(messages[-1].get("tool_calls", "[]"))
+            if not target_calls:
+                tool_messages = [message for message in messages if message["role"] == "tool"]
+                prior_calls = [
+                    message
+                    for message in messages[:-1]
+                    if message["role"] == "assistant"
+                    and json.loads(message.get("tool_calls", "[]"))
+                ]
+                if not tool_messages or not prior_calls:
+                    raise ValueError(
+                        f"{row['example_id']} must contain a tool call and returned result"
+                    )
+                returned_text = " ".join(
+                    message["content"] for message in tool_messages
+                ).casefold()
+                answer_text = messages[-1]["content"].casefold()
+                returned_terms = set(re.findall(r"[\w-]{3,}", returned_text)) | set(
+                    re.findall(r"\d{1,2}:\d{2}", returned_text)
+                )
+                answer_terms = set(re.findall(r"[\w-]{3,}", answer_text)) | set(
+                    re.findall(r"\d{1,2}:\d{2}", answer_text)
+                )
+                empty_result = all(
+                    not json.loads(message["content"]).get("results")
+                    for message in tool_messages
+                    if message.get("name") == "search_personal_memory"
+                ) if all(
+                    message.get("name") == "search_personal_memory"
+                    for message in tool_messages
+                ) else False
+                if empty_result:
+                    if not {"ничего", "нашел", "нашёл"} & answer_terms:
+                        raise ValueError(
+                            f"{row['example_id']} does not answer an empty tool result"
+                        )
+                elif not returned_terms & answer_terms:
+                    raise ValueError(
+                        f"{row['example_id']} final answer is not grounded in its tool result"
+                    )
+    return {
+        "examples": len(synthetic),
+        "unique_conversations": len(fingerprints),
+        "unique_targets": len(targets),
+    }
+
+
 def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
     """Build deterministic tokenizer-budgeted examples from cleaned sessions."""
     cleaned = read_json(config.data.cleaned)
@@ -323,7 +419,7 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
                 )
 
     for split in splits:
-        if split == "train":
+        if split == "train" and config.data.personal_train_examples is not None:
             available = len(splits[split])
             requested = config.data.personal_train_examples
             if available < requested:
@@ -336,10 +432,13 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
             )
             exclusions["personal_train_global_limit"] += available - requested
         personal_count = len(splits[split])
+        style_samples = _personal_style_samples(splits[split])
         for category, ratio in (
             ("context_retention", config.data.context_retention_ratio),
             ("general_reasoning", config.data.general_reasoning_ratio),
             ("instruction_following", config.data.instruction_following_ratio),
+            ("tool_calling", config.data.tool_calling_ratio),
+            ("rag_retrieval", config.data.rag_retrieval_ratio),
         ):
             supplemental_count = round(personal_count * ratio / config.data.personal_data_ratio)
             splits[split].extend(
@@ -351,6 +450,22 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
                     max_length=config.model.sequence_length,
                     max_target_tokens=config.data.max_target_tokens,
                     seed=config.training.seed,
+                    style_samples=style_samples,
+                )
+            )
+        if split == "train" and config.data.tool_calling_ratio > 0:
+            splits[split].append(
+                build_additional_tool_example(
+                    tokenizer,
+                    config.model.sequence_length,
+                    config.data.max_target_tokens,
+                )
+            )
+            splits[split].extend(
+                build_calendar_tool_examples(
+                    tokenizer,
+                    config.model.sequence_length,
+                    config.data.max_target_tokens,
                 )
             )
         splits[split].sort(key=lambda row: (row["timestamp"], row["example_id"]))
@@ -364,6 +479,7 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
         artifact_paths[split] = path
 
     combined = [row for split in ("train", "validation", "test") for row in splits[split]]
+    synthetic_uniqueness = _validate_synthetic_examples(combined)
     write_json(config.data.dataset, combined)
 
     relationship_counts = {
@@ -403,7 +519,10 @@ def prepare_dataset(config: AppConfig, tokenizer: Any) -> dict[str, Any]:
             "context_retention": config.data.context_retention_ratio,
             "general_reasoning": config.data.general_reasoning_ratio,
             "instruction_following": config.data.instruction_following_ratio,
+            "tool_calling": config.data.tool_calling_ratio,
+            "rag_retrieval": config.data.rag_retrieval_ratio,
         },
+        "synthetic_uniqueness": synthetic_uniqueness,
         "sequence_token_distribution": {
             name: _percentiles([row["sequence_tokens"] for row in rows])
             for name, rows in splits.items()

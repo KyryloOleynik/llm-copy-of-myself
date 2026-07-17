@@ -26,6 +26,7 @@ Fine-tune **Qwen3-4B** with **4-bit QLoRA** on private Telegram conversations, v
 This repository is not just a fine-tuning script. It implements the full lifecycle of a local personalization system:
 
 - cleans and sessionizes raw Telegram exports;
+- builds a private multilingual hybrid vector/keyword RAG index;
 - builds leakage-resistant chronological train, validation, and test splits;
 - trains a 4B-parameter model using memory-efficient QLoRA;
 - masks prompt tokens so loss is computed only on the target reply;
@@ -96,7 +97,7 @@ flowchart TD
 | Validation | Pydantic |
 | CLI | Typer |
 | Bot | aiogram |
-| Storage | SQLite |
+| Storage | SQLite FTS5 plus dense embedding vectors |
 | Quality | pytest, Ruff |
 
 ## Core engineering decisions
@@ -134,6 +135,13 @@ Prompt tokens are assigned label `-100`, so the model is optimized only on the f
 
 Personal style examples are supplemented with deterministic context-retention, reasoning, and instruction-following examples to reduce catastrophic behavioral regression.
 
+### Hybrid semantic RAG
+
+Knowledge files and cleaned Telegram sessions are split into overlapping chunks and
+embedded locally with `intfloat/multilingual-e5-small`. Retrieval combines cosine
+vector similarity with SQLite BM25 keyword ranking, preserving semantic matches as
+well as exact names, dates, and codes.
+
 ### Acceptance gate
 
 An adapter is accepted only after it:
@@ -144,96 +152,46 @@ An adapter is accepted only after it:
 4. does not regress below the base model on automated checks;
 5. reaches the configured blind style preference threshold.
 
-## Repository structure
-
-```text
-.
-├── bot.py                         # Local Telegram bot and inference queue
-├── clean_telegram_export.py       # Export cleaning and sessionization
-├── config.example.yaml            # Sanitized pipeline configuration
-├── relationships.example.json     # Example relationship mapping
-├── requirements-windows-cuda.txt  # Reproducible Windows/CUDA environment
-├── WINDOWS_TRAINING.md            # Detailed Windows training guide
-├── src/personal_ai/
-│   ├── cli.py                     # prepare-data, train, evaluate commands
-│   ├── config.py                  # Strict validated configuration models
-│   ├── data.py                    # Dataset construction and split logic
-│   ├── evaluation.py              # Capability and style evaluation gates
-│   ├── modeling.py                # Quantized loading and generation
-│   ├── supplemental.py            # Capability-preservation examples
-│   ├── training.py                # QLoRA training and checkpoint safety
-│   └── utils.py                   # Shared utilities
-└── tests/                         # Dataset, modeling, training, and bot tests
-```
-
 ## Quick start
 
-### 1. Create the environment
+### 1. Prepare private data
+
+```powershell
+New-Item -ItemType Directory -Force private_data
+Copy-Item .\DataExport_2026-07-17\result.json .\private_data\result.json
+Copy-Item .\config.example.yaml .\config.yaml
+Copy-Item .\relationships.example.json .\private_data\relationships.json
+```
+
+Keep the original export. Before processing, set the correct `owner_from_id` and
+paths in `config.yaml`, complete `private_data/relationships.json`, verify free disk
+space, and obtain consent for messages used in training. Put identity/story notes not
+present in Telegram under `private_data/knowledge/`. Media files are not required.
+
+### 2. Install and verify CUDA
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements-windows-cuda.txt
-```
-
-Verify CUDA:
-
-```powershell
 python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+personal-ai authorize-calendar
 ```
 
-### 2. Create private local configuration
-
-```powershell
-Copy-Item config.example.yaml config.yaml
-Copy-Item relationships.example.json private_data/relationships.json
-Copy-Item .env.example .env
-```
-
-Then update the private files with your own Telegram export identifier, data paths, relationship mapping, and bot token.
-
-### 3. Prepare the dataset
+### 3. Process, smoke-test, and train
 
 ```powershell
 python clean_telegram_export.py
 personal-ai prepare-data
-```
-
-### 4. Run the VRAM smoke test
-
-```powershell
+personal-ai build-rag
 personal-ai train --smoke --fresh
-```
-
-A full run is blocked until the smoke test verifies that the model and worst-case examples fit within the configured VRAM limit.
-
-### 5. Train
-
-```powershell
 personal-ai train
-```
-
-Other supported modes:
-
-```powershell
-personal-ai train --fresh
-personal-ai train --resume last
-```
-
-### 6. Evaluate
-
-```powershell
 personal-ai evaluate
 ```
 
-Evaluation covers delayed context recall, corrected-state recall, persistent instructions, reasoning, multilingual examples, and held-out personal style.
-
-### 7. Launch the bot
-
-```powershell
-python bot.py
-```
+Review the cleaning statistics and `data/processed/manifest.json` before training.
+Use `personal-ai train --fresh` for a new run or `--resume last` to resume.
 
 ## Telegram bot behavior
 
@@ -242,6 +200,7 @@ The bot:
 - loads the quantized base model and adapter once;
 - serializes GPU generation through an async queue;
 - keeps bounded per-chat history;
+- reads events and free time from the authorized Google Calendar;
 - batches rapidly arriving messages;
 - converts unsupported media into stable text placeholders;
 - conditions responses on the selected relationship type;
@@ -279,28 +238,10 @@ Never commit:
 - evaluation samples;
 - SQLite databases;
 - `.env` or `config.yaml`;
+- Google OAuth credentials or tokens under `private_data/`;
 - private relationship mappings.
 
 Obtain appropriate consent before training on another person's messages. The bot should identify itself as an AI representation and should never be presented as the real person.
-
-## Roadmap
-
-- [x] Telegram export cleaning and sessionization
-- [x] Relationship-conditioned dataset preparation
-- [x] QLoRA training pipeline
-- [x] VRAM smoke gate
-- [x] Reproducibility metadata
-- [x] Automated base-vs-adapter evaluation
-- [x] Blind style acceptance gate
-- [x] Local Telegram bot
-- [ ] Retrieval-augmented long-term memory
-- [ ] Automated CI workflow
-- [ ] Portable inference API
-- [ ] Evaluation dashboard
-
-## Current status
-
-The repository implements a complete experimental pipeline with safeguards for data leakage, reproducibility, VRAM limits, checkpoint integrity, capability regression, and style validation. Retrieval configuration is present for future work; the current bot uses bounded in-memory conversation history.
 
 ## License
 

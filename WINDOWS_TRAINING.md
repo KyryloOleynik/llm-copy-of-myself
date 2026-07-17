@@ -4,6 +4,17 @@ Use native 64-bit Windows, an NVIDIA driver compatible with the installed
 PyTorch CUDA wheel, and Python 3.11. Keep the repository on an NTFS path with
 enough space for the base model and checkpoints.
 
+First copy the Telegram JSON export into the ignored private workspace:
+
+```powershell
+New-Item -ItemType Directory -Force private_data
+Copy-Item .\DataExport_2026-07-17\result.json .\private_data\result.json
+```
+
+Set `owner_from_id` and paths in `config.yaml`, complete
+`private_data/relationships.json`, put other identity/story notes under
+`private_data/knowledge/`, and keep the original export as a backup.
+
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -23,9 +34,15 @@ unqualified newer version lets pip choose a CPU-only wheel from PyPI.
 Prepare the tokenizer-budgeted session-isolated dataset and run the bounded smoke test:
 
 ```powershell
+python clean_telegram_export.py
 personal-ai prepare-data
+personal-ai build-rag
 personal-ai train --smoke --fresh
 ```
+
+The first RAG build downloads `intfloat/multilingual-e5-small`, embeds the private
+chunks on CPU, and stores both vectors and a keyword index in
+`data/retrieval.sqlite3`.
 
 The smoke test runs one worst-case optimizer step without evaluation or periodic
 checkpointing. Full validation uses a per-device batch size of one because Qwen3's
@@ -96,9 +113,9 @@ prevents checkpoints from different prepared-dataset hashes from being mixed.
 The trainer refuses to run without CUDA or BF16 support. It uses 4-bit NF4,
 double quantization, BF16 compute, Qwen3 attention plus MLP LoRA modules,
 and masks every token except the final assistant reply. Samples over the configured
-sequence length discard old prompt context while preserving the relationship/system
-prompt when possible and retaining the newest prompt tail. The complete final assistant
-reply is always preserved, and a target that cannot fit is rejected.
+sequence length discard old prompt context while always preserving the complete
+relationship/system and tool prompt. A sample is rejected if that prompt and the
+complete assistant target cannot both fit.
 The checkpoint is text-only. Watch VRAM with `nvidia-smi`; the 12 GiB acceptance
 limit must be verified on the target PC and is recorded in `reproducibility.json`.
 

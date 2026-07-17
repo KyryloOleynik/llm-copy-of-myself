@@ -10,6 +10,7 @@ from personal_ai.data import (
     split_dataset_sessions,
 )
 from personal_ai.supplemental import build_supplemental_examples
+from personal_ai.utils import assistant_target_text
 from tests.helpers import FakeTokenizer
 
 
@@ -26,7 +27,7 @@ def _message(message_id, role, text, date, **extra):
 def _config(tmp_path: Path):
     return SimpleNamespace(
         project=SimpleNamespace(owner_from_id="owner"),
-        model=SimpleNamespace(base_model="fake/model", sequence_length=1024),
+        model=SimpleNamespace(base_model="fake/model", sequence_length=4096),
         data=SimpleNamespace(
             source=tmp_path / "raw.json",
             cleaned=tmp_path / "cleaned.json",
@@ -35,11 +36,13 @@ def _config(tmp_path: Path):
             train_ratio=0.8,
             validation_ratio=0.1,
             max_target_tokens=256,
-            personal_train_examples=9,
+            personal_train_examples=None,
             personal_data_ratio=1.0,
             context_retention_ratio=0.0,
             general_reasoning_ratio=0.0,
             instruction_following_ratio=0.0,
+            tool_calling_ratio=0.0,
+            rag_retrieval_ratio=0.0,
         ),
         training=SimpleNamespace(seed=42),
     )
@@ -188,10 +191,8 @@ def test_prepare_dataset_is_deterministic_and_session_isolated(tmp_path):
         for line in (config.data.output_dir / "train.jsonl").read_text().splitlines()
         if (row := json.loads(line))["session_id"] == "session-00"
     )
-    assert leading["messages"][1] == {
-        "role": "assistant",
-        "content": "meaningful opening owner context",
-    }
+    assert leading["messages"][1]["role"] == "assistant"
+    assert leading["messages"][1]["content"] == "meaningful opening owner context"
 
 
 def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
@@ -214,6 +215,12 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     instructions = build_supplemental_examples(
         split="train", category="instruction_following", **kwargs
     )
+    tool_rows = build_supplemental_examples(
+        split="train", category="tool_calling", **kwargs
+    )
+    rag_rows = build_supplemental_examples(
+        split="train", category="rag_retrieval", **kwargs
+    )
     assert context_train == build_supplemental_examples(
         split="train", category="context_retention", **kwargs
     )
@@ -224,15 +231,28 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     assert all(row["source_type"] == "general_reasoning" for row in reasoning)
     assert all(row["source_type"] == "instruction_following" for row in instructions)
     assert any(row["messages"][-1]["content"].startswith("{") for row in instructions)
-    all_rows = context_train + context_test + reasoning + reasoning_test + instructions
+    assert all(row["tools"] != "[]" for row in tool_rows + rag_rows)
+    all_rows = (
+        context_train
+        + context_test
+        + reasoning
+        + reasoning_test
+        + instructions
+        + tool_rows
+        + rag_rows
+    )
     assert all(row["messages"][-1]["role"] == "assistant" for row in all_rows)
+    assert all(
+        row["messages"][0]["content"].startswith("Отвечай в стиле Родиона.")
+        for row in all_rows
+    )
     fingerprints = {
         json.dumps(row["messages"], ensure_ascii=False, sort_keys=True)
         for row in all_rows
     }
     assert len(fingerprints) == len(all_rows)
     targets = [
-        row["messages"][-1]["content"].strip().casefold()
+        assistant_target_text(row["messages"]).strip().casefold()
         for row in all_rows
     ]
     assert len(targets) == len(set(targets))

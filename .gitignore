@@ -6,8 +6,6 @@ __pycache__/
 .idea/
 .agents/
 .env
-.env.*
-!.env.example
 config.yaml
 DataExport_*/
 private_data/

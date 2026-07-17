@@ -12,12 +12,13 @@ data:
   validation_ratio: 0.05
   test_ratio: 0.05
   max_target_tokens: 256
-  personal_train_examples: 1000
   contains_unredacted_private_data: true
-  personal_data_ratio: 0.86
-  context_retention_ratio: 0.08
+  personal_data_ratio: 0.80
+  context_retention_ratio: 0.06
   general_reasoning_ratio: 0.02
   instruction_following_ratio: 0.04
+  tool_calling_ratio: 0.04
+  rag_retrieval_ratio: 0.04
 
 model:
   base_model: Qwen/Qwen3-4B-Instruct-2507
@@ -45,9 +46,12 @@ training:
 
 retrieval:
   database: data/retrieval.sqlite3
-  context_limit: 8192
-
-bot:
-  polling: true
-  state_database: data/bot.sqlite3
-  model_server_url: http://127.0.0.1:8080/v1
+  knowledge_dir: private_data/knowledge
+  include_cleaned_telegram: true
+  chunk_chars: 900
+  chunk_overlap_chars: 120
+  max_results: 5
+  embedding_model: intfloat/multilingual-e5-small
+  embedding_device: cpu
+  embedding_batch_size: 32
+  vector_weight: 0.75

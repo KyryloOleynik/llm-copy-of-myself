@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,10 +11,12 @@ from tqdm.auto import tqdm
 
 from personal_ai.config import AppConfig
 from personal_ai.modeling import (
+    generate_reply,
     generate_replies,
     load_inference_model,
     personal_style_generation_options,
 )
+from personal_ai.tools import TOOL_SCHEMAS, parse_tool_calls
 from personal_ai.training import validate_prepared_dataset
 from personal_ai.utils import (
     iter_jsonl,
@@ -135,6 +138,115 @@ def _reasoning_cases() -> list[dict[str, Any]]:
     ]
 
 
+def _tool_cases() -> list[dict[str, Any]]:
+    system = {"role": "system", "content": relationship_system_message("friend")}
+    calendar_system = {
+        "role": "system",
+        "content": (
+            relationship_system_message("friend")
+            + " Текущая дата и время: 2026-07-17T12:00:00+03:00. "
+            "Для относительных дат используй это время."
+        ),
+    }
+    memory_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_personal_memory",
+                    "arguments": {"query": "первый проект", "limit": 3},
+                },
+            }
+        ],
+    }
+    calendar_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_google_calendar",
+                    "arguments": {
+                        "action": "events",
+                        "start": "2026-07-18T12:00:00+03:00",
+                        "end": "2026-07-18T20:00:00+03:00",
+                    },
+                },
+            }
+        ],
+    }
+    return [
+        {
+            "id": "tool-calculator",
+            "category": "tool_calling",
+            "messages": [
+                system,
+                {"role": "user", "content": "посчитай точно (47 + 5) * 3, не угадывай"},
+            ],
+            "expected_tool": "calculate",
+        },
+        {
+            "id": "tool-personal-memory",
+            "category": "tool_calling",
+            "messages": [
+                system,
+                {"role": "user", "content": "какой у меня был первый проект? проверь память"},
+            ],
+            "expected_tool": "search_personal_memory",
+        },
+        {
+            "id": "tool-google-calendar",
+            "category": "tool_calling",
+            "messages": [
+                calendar_system,
+                {"role": "user", "content": "что у меня завтра после обеда?"},
+            ],
+            "expected_tool": "query_google_calendar",
+        },
+        {
+            "id": "rag-grounded-answer",
+            "category": "rag_grounding",
+            "messages": [
+                system,
+                {"role": "user", "content": "какой у меня был первый проект? проверь память"},
+                memory_call,
+                {
+                    "role": "tool",
+                    "name": "search_personal_memory",
+                    "content": (
+                        '{"results":[{"source":"identity.md#0",'
+                        '"content":"Первый проект: сайт с меткой COBALT-741."}]}'
+                    ),
+                },
+            ],
+            "expected": ["COBALT-741"],
+        },
+        {
+            "id": "calendar-grounded-answer",
+            "category": "tool_grounding",
+            "messages": [
+                calendar_system,
+                {"role": "user", "content": "что у меня завтра после обеда?"},
+                calendar_call,
+                {
+                    "role": "tool",
+                    "name": "query_google_calendar",
+                    "content": (
+                        '{"action":"events","time_zone":"Europe/Kyiv","events":['
+                        '{"summary":"Созвон по проекту",'
+                        '"start":"2026-07-18T15:00:00+03:00",'
+                        '"end":"2026-07-18T15:45:00+03:00"}]}'
+                    ),
+                },
+            ],
+            "expected": ["15:00", "созвон"],
+        },
+    ]
+
+
 def _adapter_is_loadable(path: Path) -> bool:
     return (path / "adapter_config.json").is_file() and any(
         (path / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin")
@@ -247,6 +359,7 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
         )
     cases = [case for distance in DISTANCES for case in _diagnostic_cases(distance)]
     cases.extend(_reasoning_cases())
+    tool_cases = _tool_cases()
     test_rows = [
         row
         for row in iter_jsonl(config.data.output_dir / "test.jsonl")
@@ -257,7 +370,7 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
     style_outputs: dict[str, dict[str, str]] = {}
     results: dict[str, Any] = {}
     candidates = _candidate_paths(config.training.output_dir)
-    total_generations = len(candidates) * (len(cases) + len(style_sample))
+    total_generations = len(candidates) * (len(cases) + len(tool_cases) + len(style_sample))
     with tqdm(total=total_generations, desc="Evaluating", unit="reply") as progress:
         for adapter in candidates:
             candidate = "base" if adapter is None else adapter.name
@@ -296,8 +409,43 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
                             }
                         )
                     progress.update(len(case_batch))
+                for case in tool_cases:
+                    output, actual_tokens = generate_reply(
+                        torch,
+                        tokenizer,
+                        model,
+                        case["messages"],
+                        tools=TOOL_SCHEMAS,
+                        max_new_tokens=128,
+                        do_sample=False,
+                    )
+                    if "expected_tool" in case:
+                        try:
+                            calls = parse_tool_calls(output)
+                        except (json.JSONDecodeError, ValueError):
+                            calls = []
+                        passed = any(call.name == case["expected_tool"] for call in calls)
+                    else:
+                        passed = _score_case(output, case["expected"])
+                    rows.append(
+                        {
+                            "id": case["id"],
+                            "category": case["category"],
+                            "target_distance": None,
+                            "actual_prompt_tokens": actual_tokens,
+                            "output": output,
+                            "passed": passed,
+                        }
+                    )
+                    progress.update(1)
                 scores: dict[str, float] = {}
-                for category in ("context", "instruction", "reasoning"):
+                for category in (
+                    "context",
+                    "instruction",
+                    "reasoning",
+                    "tool_calling",
+                    "rag_grounding",
+                ):
                     scored = [
                         row
                         for row in rows
@@ -370,6 +518,9 @@ def evaluate_checkpoints(config: AppConfig) -> Path:
         for category in ("context", "instruction", "reasoning"):
             if result["scores"][category] < base_scores[category]:
                 reasons.append(f"{category} regressed below the base model")
+        for category in ("tool_calling", "rag_grounding"):
+            if result["scores"][category] < 0.80:
+                reasons.append(f"{category} score is below 80%")
         if not style_sample:
             reasons.append("held-out style sample is empty")
         elif result["style_total"] < len(style_sample):

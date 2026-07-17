@@ -4,6 +4,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from personal_ai.utils import materialize_messages
+
 
 LANGUAGE_LORA_SUFFIXES = {
     "q_proj",
@@ -77,16 +79,19 @@ def generate_reply(
     torch: Any,
     tokenizer: Any,
     model: Any,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     max_new_tokens: int,
+    tools: list[dict[str, Any]] | None = None,
     **generation_options: Any,
 ) -> tuple[str, int]:
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if tools:
+        template_kwargs["tools"] = tools
+    prompt = tokenizer.apply_chat_template(materialize_messages(messages), **template_kwargs)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.inference_mode():
         output = model.generate(
@@ -115,7 +120,7 @@ def generate_replies(
         return []
     prompts = [
         tokenizer.apply_chat_template(
-            messages,
+            materialize_messages(messages),
             tokenize=False,
             add_generation_prompt=True,
         )

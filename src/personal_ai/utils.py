@@ -62,30 +62,93 @@ def token_ids(rendered: Any) -> list[int]:
     return [int(value) for value in rendered]
 
 
+def normalize_messages_for_storage(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Store flexible tool messages in one stable Arrow/JSON schema."""
+    return [
+        {
+            "content": str(message.get("content") or ""),
+            "name": str(message.get("name") or ""),
+            "role": str(message["role"]),
+            "tool_calls": json.dumps(
+                message.get("tool_calls", []),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        }
+        for message in messages
+    ]
+
+
+def materialize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert stored string fields back to Transformers' native tool-message format."""
+    materialized: list[dict[str, Any]] = []
+    for message in messages:
+        item: dict[str, Any] = {
+            "role": str(message["role"]),
+            "content": str(message.get("content") or ""),
+        }
+        name = message.get("name")
+        if name:
+            item["name"] = str(name)
+        calls = message.get("tool_calls")
+        if isinstance(calls, str):
+            calls = json.loads(calls) if calls else []
+        if calls:
+            item["tool_calls"] = calls
+        materialized.append(item)
+    return materialized
+
+
+def decode_tools(tools: str | list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if isinstance(tools, str):
+        return json.loads(tools) if tools else []
+    return list(tools or [])
+
+
+def assistant_target_text(messages: list[dict[str, Any]]) -> str:
+    """Return a readable, unique representation of the final supervised target."""
+    target = materialize_messages(messages)[-1]
+    calls = target.get("tool_calls")
+    if calls:
+        return json.dumps(calls, ensure_ascii=False, sort_keys=True)
+    return str(target.get("content") or "")
+
+
 def render_chat_ids(
     tokenizer: Any,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     generation: bool,
+    tools: str | list[dict[str, Any]] | None = None,
 ) -> list[int]:
+    materialized = materialize_messages(messages)
+    decoded_tools = decode_tools(tools)
+    template_kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "add_generation_prompt": generation,
+    }
+    if decoded_tools:
+        template_kwargs["tools"] = decoded_tools
     return token_ids(
         tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=generation,
+            materialized,
+            **template_kwargs,
         )
     )
 
 
 def assistant_target_ids(
     tokenizer: Any,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
+    tools: str | list[dict[str, Any]] | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
     """Render one chat and return verified prompt, complete, and final-target IDs."""
     if not messages or messages[-1]["role"] != "assistant":
         raise ValueError("Every example must end with an assistant target")
-    prompt_ids = render_chat_ids(tokenizer, messages[:-1], generation=True)
-    full_ids = render_chat_ids(tokenizer, messages, generation=False)
+    prompt_ids = render_chat_ids(tokenizer, messages[:-1], generation=True, tools=tools)
+    full_ids = render_chat_ids(tokenizer, messages, generation=False, tools=tools)
     if full_ids[: len(prompt_ids)] != prompt_ids:
         raise ValueError("Prompt is not a prefix of the complete example")
     target_ids = full_ids[len(prompt_ids) :]

@@ -11,6 +11,7 @@ from tests.helpers import FakeTokenizer
 def test_only_final_reply_has_labels():
     tokenizer = FakeTokenizer()
     messages = [
+        {"role": "system", "content": "style"},
         {"role": "user", "content": "abc"},
         {"role": "assistant", "content": "xy"},
     ]
@@ -81,6 +82,7 @@ def test_smoke_audit_file_persists_the_exact_collator_arrays(tmp_path):
         "sequence_tokens": 42,
         "target_tokens": 4,
         "messages": [
+            {"role": "system", "content": "style"},
             {"role": "user", "content": "question"},
             {"role": "assistant", "content": "reply"},
         ],
@@ -131,6 +133,7 @@ def test_smoke_audit_separates_accelerate_lookahead_from_backward(tmp_path):
         **base,
         "example_id": "used",
         "messages": [
+            {"role": "system", "content": "style"},
             {"role": "user", "content": "one"},
             {"role": "assistant", "content": "reply one"},
         ],
@@ -139,6 +142,7 @@ def test_smoke_audit_separates_accelerate_lookahead_from_backward(tmp_path):
         **base,
         "example_id": "lookahead",
         "messages": [
+            {"role": "system", "content": "style"},
             {"role": "user", "content": "two"},
             {"role": "assistant", "content": "reply two"},
         ],
@@ -173,6 +177,7 @@ def test_smoke_audit_separates_accelerate_lookahead_from_backward(tmp_path):
 def test_overflow_truncates_prompt_without_truncating_target():
     tokenizer = FakeTokenizer()
     messages = [
+        {"role": "system", "content": "s"},
         {"role": "user", "content": "abcdefghij"},
         {"role": "assistant", "content": "xy"},
     ]
@@ -185,7 +190,7 @@ def test_overflow_truncates_prompt_without_truncating_target():
     assert batch["input_ids"].shape[1] == 8
     assert record["original_sequence_tokens"] == len(original)
     assert record["prompt_tokens_truncated"] == len(original) - 8
-    assert record["prompt_truncation_strategy"] == "keep_recent_prompt_tail"
+    assert record["prompt_truncation_strategy"] == "preserve_system_and_recent_tail"
     assert record["trained_target_tokens"] == len(target)
     assert record["training_labels"][-len(target) :] == target
     assert collator.audit["truncated_examples"] == 1
@@ -216,10 +221,11 @@ def test_target_that_cannot_leave_prompt_space_is_rejected():
     with pytest.raises(ValueError, match="leaves no prompt tokens"):
         collator(
             [
-                {
-                    "messages": [
-                        {"role": "user", "content": "a"},
-                        {"role": "assistant", "content": "abcdefghij"},
+                    {
+                        "messages": [
+                            {"role": "system", "content": "style"},
+                            {"role": "user", "content": "a"},
+                            {"role": "assistant", "content": "abcdefghij"},
                     ]
                 }
             ]
@@ -232,10 +238,11 @@ def test_oversized_target_is_rejected():
     with pytest.raises(ValueError, match="Assistant target"):
         collator(
             [
-                {
-                    "messages": [
-                        {"role": "user", "content": "a"},
-                        {"role": "assistant", "content": "long"},
+                    {
+                        "messages": [
+                            {"role": "system", "content": "style"},
+                            {"role": "user", "content": "a"},
+                            {"role": "assistant", "content": "long"},
                     ]
                 }
             ]
@@ -256,10 +263,11 @@ def test_prompt_prefix_mismatch_is_rejected():
     with pytest.raises(ValueError, match="not a prefix"):
         collator(
             [
-                {
-                    "messages": [
-                        {"role": "user", "content": "a"},
-                        {"role": "assistant", "content": "b"},
+                    {
+                        "messages": [
+                            {"role": "system", "content": "style"},
+                            {"role": "user", "content": "a"},
+                            {"role": "assistant", "content": "b"},
                     ]
                 }
             ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 import re
 import shutil
@@ -12,7 +13,14 @@ from typing import Any
 
 from personal_ai.config import AppConfig
 from personal_ai.modeling import load_quantized_base, load_tokenizer, select_language_lora_modules
-from personal_ai.utils import assistant_target_ids, iter_jsonl, read_json, render_chat_ids, write_json
+from personal_ai.utils import (
+    assistant_target_ids,
+    assistant_target_text,
+    iter_jsonl,
+    read_json,
+    render_chat_ids,
+    write_json,
+)
 
 
 IGNORE_INDEX = -100
@@ -20,12 +28,13 @@ IGNORE_INDEX = -100
 
 def truncate_prompt_tokens(
     tokenizer: Any,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     prompt_ids: list[int],
     target_ids: list[int],
     max_length: int,
+    tools: str | list[dict[str, Any]] | None = None,
 ) -> tuple[list[int], int, str]:
-    """Fit prompt+target while preserving the target and, when possible, the system prompt."""
+    """Fit prompt+target without ever discarding an existing system/tool prompt."""
     prompt_budget = max_length - len(target_ids)
     if prompt_budget < 1:
         raise ValueError(
@@ -36,11 +45,21 @@ def truncate_prompt_tokens(
         return prompt_ids, 0, "none"
 
     if messages and messages[0]["role"] == "system":
-        system_ids = render_chat_ids(tokenizer, messages[:1], generation=False)
-        if prompt_ids[: len(system_ids)] == system_ids and len(system_ids) < prompt_budget:
-            recent_budget = prompt_budget - len(system_ids)
-            truncated = system_ids + prompt_ids[-recent_budget:]
-            return truncated, len(prompt_ids) - len(truncated), "preserve_system_and_recent_tail"
+        system_ids = render_chat_ids(
+            tokenizer,
+            messages[:1],
+            generation=False,
+            tools=tools,
+        )
+        if prompt_ids[: len(system_ids)] != system_ids:
+            raise ValueError("Rendered system/tool prompt is not a prompt prefix")
+        if len(system_ids) >= prompt_budget:
+            raise ValueError(
+                "System/tool prompt cannot fit with the assistant target; increase sequence_length"
+            )
+        recent_budget = prompt_budget - len(system_ids)
+        truncated = system_ids + prompt_ids[-recent_budget:]
+        return truncated, len(prompt_ids) - len(truncated), "preserve_system_and_recent_tail"
 
     truncated = prompt_ids[-prompt_budget:]
     return truncated, len(prompt_ids) - len(truncated), "keep_recent_prompt_tail"
@@ -164,8 +183,16 @@ class ReplyOnlyCollator:
         pending_captures: list[dict[str, Any]] = []
         for example in examples:
             messages = example["messages"]
+            tools = example.get("tools", "[]")
+            if not messages or messages[0].get("role") != "system":
+                self.audit["missing_system_prompt"] += 1
+                raise ValueError("Every training example must start with a system prompt")
             try:
-                prompt_ids, full_ids, target_ids = assistant_target_ids(self.tokenizer, messages)
+                prompt_ids, full_ids, target_ids = assistant_target_ids(
+                    self.tokenizer,
+                    messages,
+                    tools,
+                )
             except ValueError as exc:
                 if "prefix" in str(exc):
                     self.audit["prompt_prefix_mismatch"] += 1
@@ -190,6 +217,7 @@ class ReplyOnlyCollator:
                             prompt_ids,
                             target_ids,
                             self.max_length,
+                            tools,
                         )
                     )
                 except ValueError:
@@ -213,7 +241,7 @@ class ReplyOnlyCollator:
                         "split": str(example.get("split", "")),
                         "timestamp": str(example.get("timestamp", "")),
                         "masked_prompt_messages": messages[:-1],
-                        "expected_assistant_reply": messages[-1]["content"],
+                        "expected_assistant_reply": assistant_target_text(messages),
                         "masked_prompt_tokens": len(prompt_ids),
                         "trained_target_tokens": len(target_ids),
                         "total_sequence_tokens": len(full_ids),
@@ -268,6 +296,13 @@ def validate_prepared_dataset(config: AppConfig) -> dict[str, Any]:
         raise RuntimeError("Prepared dataset sequence length differs from training configuration")
     if not manifest.get("contains_unredacted_private_data"):
         raise RuntimeError("Unredacted private-data acknowledgement is missing")
+    uniqueness = manifest.get("synthetic_uniqueness", {})
+    if not uniqueness or not (
+        uniqueness.get("examples")
+        == uniqueness.get("unique_conversations")
+        == uniqueness.get("unique_targets")
+    ):
+        raise RuntimeError("Prepared synthetic examples are not globally unique")
     session_splits: dict[str, str] = {}
     for split in ("train", "validation", "test"):
         path = config.data.output_dir / f"{split}.jsonl"
@@ -284,6 +319,10 @@ def validate_prepared_dataset(config: AppConfig) -> dict[str, Any]:
                 raise ValueError(f"{row['example_id']} exceeds the sequence limit")
             if not 0 < row["target_tokens"] <= config.data.max_target_tokens:
                 raise ValueError(f"{row['example_id']} has invalid target length")
+            if row["source_type"] in {"tool_calling", "rag_retrieval"} and not json.loads(
+                row.get("tools", "[]")
+            ):
+                raise ValueError(f"{row['example_id']} is missing tool definitions")
     return manifest
 
 
@@ -323,7 +362,8 @@ def _smoke_pool_record(example: dict[str, Any]) -> dict[str, Any]:
         "sequence_tokens": int(example["sequence_tokens"]),
         "target_tokens": int(example["target_tokens"]),
         "masked_prompt_messages": messages[:-1],
-        "expected_assistant_reply": messages[-1]["content"],
+        "expected_assistant_reply": assistant_target_text(messages),
+        "tools": str(example.get("tools", "[]")),
     }
 
 
@@ -411,7 +451,9 @@ def prepared_dataset_features() -> Any:
             "messages": List(
                 {
                     "content": Value("string"),
+                    "name": Value("string"),
                     "role": Value("string"),
+                    "tool_calls": Value("string"),
                 }
             ),
             "relationship": Value("string"),
@@ -422,6 +464,7 @@ def prepared_dataset_features() -> Any:
             "target_message_ids": List(Value("int64")),
             "target_tokens": Value("int64"),
             "timestamp": Value("string"),
+            "tools": Value("string"),
         }
     )
 

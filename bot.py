@@ -11,7 +11,10 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
@@ -28,6 +31,7 @@ from personal_ai.modeling import (
     load_inference_model,
     personal_style_generation_options,
 )
+from personal_ai.tools import TOOL_SCHEMAS, execute_tool_call, parse_tool_calls
 from personal_ai.utils import load_dotenv, read_json, relationship_system_message, render_chat_ids
 
 
@@ -55,6 +59,27 @@ MAX_REPLY_PARTS = int(os.getenv("MAX_REPLY_PARTS", "4"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "30"))
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
 STATE_DATABASE = Path(os.getenv("STATE_DATABASE", str(ROOT / "data/bot.sqlite3")))
+RETRIEVAL_DATABASE = Path(
+    os.getenv("RETRIEVAL_DATABASE", str(ROOT / "data/retrieval.sqlite3"))
+)
+GOOGLE_CALENDAR_CREDENTIALS = Path(
+    os.getenv(
+        "GOOGLE_CALENDAR_CREDENTIALS",
+        str(ROOT / "private_data/google_calendar_credentials.json"),
+    )
+)
+GOOGLE_CALENDAR_TOKEN = Path(
+    os.getenv(
+        "GOOGLE_CALENDAR_TOKEN",
+        str(ROOT / "private_data/google_calendar_token.json"),
+    )
+)
+GOOGLE_CALENDAR_IDS = tuple(
+    value.strip()
+    for value in os.getenv("GOOGLE_CALENDAR_IDS", "primary").split(",")
+    if value.strip()
+)
+GOOGLE_CALENDAR_TIME_ZONE = os.getenv("GOOGLE_CALENDAR_TIME_ZONE", "Europe/Kyiv")
 EVALUATION_REPORT = Path(
     os.getenv("EVALUATION_REPORT", str(ROOT / "data/processed/evaluation/evaluation.json"))
 )
@@ -67,7 +92,6 @@ RELATIONSHIPS = {
     "acquaintance": "Acquaintance",
     "professional_contact": "Professional contact",
     "family": "Family",
-    "school_acquaintance": "School acquaintance",
 }
 
 dp = Dispatcher()
@@ -259,30 +283,95 @@ class LocalModel:
         )
         logging.info("Model loaded and ready; it will remain resident until bot.py exits")
 
-    def _fit_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    def _fit_messages(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> list[dict[str, object]]:
         """Drop oldest complete turns until prompt plus reply reserve fits 8K."""
+        if not messages or messages[0].get("role") != "system":
+            raise ValueError("Inference context must start with the system prompt")
         fitted = list(messages)
         while True:
-            input_ids = render_chat_ids(self.tokenizer, fitted, generation=True)
+            input_ids = render_chat_ids(
+                self.tokenizer,
+                fitted,
+                generation=True,
+                tools=tools,
+            )
             if len(input_ids) + MAX_NEW_TOKENS <= MAX_CONTEXT_TOKENS:
                 return fitted
             if len(fitted) <= 2:
                 raise ValueError("System prompt and latest user message exceed context budget")
-            fitted.pop(1)
-            if len(fitted) > 2 and fitted[1]["role"] == "assistant":
-                fitted.pop(1)
+            next_user = next(
+                (
+                    index
+                    for index, message in enumerate(fitted[2:], start=2)
+                    if message.get("role") == "user"
+                ),
+                None,
+            )
+            if next_user is None:
+                raise ValueError("System prompt and latest tool interaction exceed context budget")
+            del fitted[1:next_user]
 
-    def generate(self, messages: list[dict[str, str]]) -> str:
-        messages = self._fit_messages(messages)
-        reply, _ = generate_reply(
+    def generate(self, messages: list[dict[str, object]]) -> str:
+        messages = self._fit_messages(messages, TOOL_SCHEMAS)
+        for _ in range(2):
+            reply, _ = generate_reply(
+                self.torch,
+                self.tokenizer,
+                self.model,
+                messages,
+                max_new_tokens=MAX_NEW_TOKENS,
+                tools=TOOL_SCHEMAS,
+                **personal_style_generation_options(),
+            )
+            calls = parse_tool_calls(reply)
+            if not calls:
+                return reply
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            },
+                        }
+                        for call in calls
+                    ],
+                }
+            )
+            for call in calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": call.name,
+                        "content": execute_tool_call(
+                            call,
+                            RETRIEVAL_DATABASE,
+                            GOOGLE_CALENDAR_CREDENTIALS,
+                            GOOGLE_CALENDAR_TOKEN,
+                            GOOGLE_CALENDAR_IDS,
+                            GOOGLE_CALENDAR_TIME_ZONE,
+                        ),
+                    }
+                )
+            messages = self._fit_messages(messages, TOOL_SCHEMAS)
+        final_reply, _ = generate_reply(
             self.torch,
             self.tokenizer,
             self.model,
             messages,
             max_new_tokens=MAX_NEW_TOKENS,
+            tools=TOOL_SCHEMAS,
             **personal_style_generation_options(),
         )
-        return reply
+        return final_reply
 
 
 @dataclass
@@ -316,9 +405,16 @@ async def generation_worker() -> None:
                 continue
             history = chat_history.setdefault(request.chat_id, [])
             history.append({"role": "user", "content": request.incoming})
+            current_time = datetime.now(ZoneInfo(GOOGLE_CALENDAR_TIME_ZONE)).isoformat(
+                timespec="seconds"
+            )
             prompt = [
                 {
-                    "content": relationship_system_message(request.relationship),
+                    "content": (
+                        relationship_system_message(request.relationship)
+                        + f" Текущая дата и время: {current_time}. "
+                        "Для относительных дат используй это время."
+                    ),
                     "role": "system",
                 },
                 *history[-MAX_HISTORY_TURNS * 2 :],

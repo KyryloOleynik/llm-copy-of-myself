@@ -25,12 +25,14 @@ class DataConfig(StrictModel):
     validation_ratio: float = Field(0.1, ge=0, le=1)
     test_ratio: float = Field(0.1, ge=0, le=1)
     max_target_tokens: int = Field(256, ge=1)
-    personal_train_examples: int = Field(5779, ge=1)
+    personal_train_examples: int | None = Field(default=None, ge=1)
     contains_unredacted_private_data: bool
-    personal_data_ratio: float = Field(0.86, ge=0, le=1)
-    context_retention_ratio: float = Field(0.08, ge=0, le=1)
+    personal_data_ratio: float = Field(0.80, ge=0, le=1)
+    context_retention_ratio: float = Field(0.06, ge=0, le=1)
     general_reasoning_ratio: float = Field(0.02, ge=0, le=1)
     instruction_following_ratio: float = Field(0.04, ge=0, le=1)
+    tool_calling_ratio: float = Field(0.04, ge=0, le=1)
+    rag_retrieval_ratio: float = Field(0.04, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_ratios(self) -> "DataConfig":
@@ -47,6 +49,8 @@ class DataConfig(StrictModel):
                 + self.context_retention_ratio
                 + self.general_reasoning_ratio
                 + self.instruction_following_ratio
+                + self.tool_calling_ratio
+                + self.rag_retrieval_ratio
                 - 1.0
             )
             > 1e-9
@@ -100,14 +104,22 @@ class TrainingConfig(StrictModel):
 
 
 class RetrievalConfig(StrictModel):
-    database: Path
-    context_limit: int = 8192
+    database: Path = Path("data/retrieval.sqlite3")
+    knowledge_dir: Path = Path("private_data/knowledge")
+    include_cleaned_telegram: bool = True
+    chunk_chars: int = Field(900, ge=200, le=4000)
+    chunk_overlap_chars: int = Field(120, ge=0, le=1000)
+    max_results: int = Field(5, ge=1, le=10)
+    embedding_model: str = "intfloat/multilingual-e5-small"
+    embedding_device: str = "cpu"
+    embedding_batch_size: int = Field(32, ge=1, le=256)
+    vector_weight: float = Field(0.75, ge=0, le=1)
 
-
-class BotConfig(StrictModel):
-    polling: bool = True
-    state_database: Path
-    model_server_url: str
+    @model_validator(mode="after")
+    def validate_chunking(self) -> "RetrievalConfig":
+        if self.chunk_overlap_chars >= self.chunk_chars:
+            raise ValueError("retrieval.chunk_overlap_chars must be smaller than chunk_chars")
+        return self
 
 
 class AppConfig(StrictModel):
@@ -115,8 +127,7 @@ class AppConfig(StrictModel):
     data: DataConfig
     model: ModelConfig
     training: TrainingConfig
-    retrieval: RetrievalConfig
-    bot: BotConfig
+    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
 
 
 def load_config(path: Path) -> AppConfig:
