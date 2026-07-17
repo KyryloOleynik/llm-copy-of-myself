@@ -7,6 +7,7 @@ from typing import Any
 from personal_ai.tools import TOOL_SCHEMAS, calculate
 from personal_ai.utils import (
     assistant_target_ids,
+    assistant_target_spans,
     assistant_target_text,
     normalize_messages_for_storage,
     relationship_system_message,
@@ -58,9 +59,19 @@ def _row(
     tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     tools = tools or []
-    _, full_ids, target_ids = assistant_target_ids(tokenizer, messages, tools)
-    if not 0 < len(target_ids) <= max_target_tokens:
-        raise ValueError("Supplemental target violates the configured token budget")
+    stored_tools = json.dumps(tools, ensure_ascii=False, sort_keys=True)
+    supervise_all_assistant_turns = category in {"tool_calling", "rag_retrieval"}
+    if supervise_all_assistant_turns:
+        full_ids, target_spans = assistant_target_spans(tokenizer, messages, stored_tools)
+        target_lengths = [end - start for start, end in target_spans]
+        target_tokens = sum(target_lengths)
+        if any(length > max_target_tokens for length in target_lengths):
+            raise ValueError("Supplemental assistant turn violates the token budget")
+    else:
+        _, full_ids, target_ids = assistant_target_ids(tokenizer, messages, stored_tools)
+        target_tokens = len(target_ids)
+        if not 0 < target_tokens <= max_target_tokens:
+            raise ValueError("Supplemental target violates the configured token budget")
     if len(full_ids) > max_length:
         raise ValueError("Supplemental example violates the configured sequence budget")
     example_id = f"supplemental_{category}_{split}_{index:05d}"
@@ -74,9 +85,10 @@ def _row(
         "timestamp": f"synthetic-{split}-{index:05d}",
         "target_message_ids": [],
         "sequence_tokens": len(full_ids),
-        "target_tokens": len(target_ids),
+        "target_tokens": target_tokens,
+        "supervise_all_assistant_turns": supervise_all_assistant_turns,
         "messages": normalize_messages_for_storage(messages),
-        "tools": json.dumps(tools, ensure_ascii=False, sort_keys=True),
+        "tools": stored_tools,
     }
 
 
@@ -255,8 +267,6 @@ def _tool_messages(
         "content": f"посчитай точно {expression}, не угадывай, расчёт {index}",
     }
     call = _tool_call("calculate", {"expression": expression})
-    if index % 2 == 0:
-        return [system, user, call]
     return [
         system,
         user,
@@ -268,7 +278,9 @@ def _tool_messages(
         },
         {
             "role": "assistant",
-            "content": f"{_style_ack(rng, style_samples)}, получается {result}",
+            "content": (
+                f"{_style_ack(rng, style_samples)}, для расчёта {index} получается {result}"
+            ),
         },
     ]
 
@@ -312,8 +324,6 @@ def _rag_messages(
         "content": f"что написано в учебной записи {marker} про {topic}? проверь память",
     }
     call = _tool_call("search_personal_memory", {"query": query, "limit": 3})
-    if index % 3 == 0:
-        return [system, user, call]
     if index % 5 == 0:
         tool_result = {"results": []}
         answer = f"по записи {marker} ничего не нашел, выдумывать не буду"
@@ -500,20 +510,7 @@ def build_calendar_tool_examples(
             "content": "свободен с 10:00 до 12:30 и потом с 15:00 до 18:00",
         },
     ]
-    conversations = [
-        [
-            system,
-            {"role": "user", "content": "какие у меня планы завтра с 12 до 20?"},
-            event_call,
-        ],
-        event_answer_messages,
-        [
-            system,
-            {"role": "user", "content": "найди свободное окно в воскресенье с 10 до 18"},
-            free_call,
-        ],
-        free_answer_messages,
-    ]
+    conversations = [event_answer_messages, free_answer_messages]
     return [
         _row(
             tokenizer,

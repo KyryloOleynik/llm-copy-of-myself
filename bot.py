@@ -102,6 +102,23 @@ generation_queue: asyncio.Queue["GenerationRequest"] | None = None
 user_relationships: dict[int, str] = {}
 
 
+def live_system_message(relationship: str, current_time: str) -> str:
+    """Add an explicit tool policy only to live bot conversations."""
+    return (
+        relationship_system_message(relationship)
+        + " Тебе доступны инструменты: calculate для точных вычислений, "
+        "search_personal_memory для личных фактов и истории, "
+        "query_google_calendar для расписания и свободного времени. "
+        "Если вопрос требует этих данных, ОБЯЗАТЕЛЬНО сначала сделай нативный "
+        "вызов подходящего инструмента вместо ответа по памяти или догадки. "
+        "Не описывай вызов словами и не придумывай результат. После получения "
+        "результата инструмента ответь в своём обычном стиле только по этим данным. "
+        "Если данных нет или инструмент вернул ошибку, прямо скажи об этом."
+        f" Текущая дата и время: {current_time}. "
+        "Для относительных дат используй это время."
+    )
+
+
 def _has_adapter_weights(path: Path) -> bool:
     return (path / "adapter_config.json").is_file() and any(
         (path / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin")
@@ -347,18 +364,21 @@ class LocalModel:
                 }
             )
             for call in calls:
+                logging.info("Using tool %s with arguments %r", call.name, call.arguments)
+                tool_result = execute_tool_call(
+                    call,
+                    RETRIEVAL_DATABASE,
+                    GOOGLE_CALENDAR_CREDENTIALS,
+                    GOOGLE_CALENDAR_TOKEN,
+                    GOOGLE_CALENDAR_IDS,
+                    GOOGLE_CALENDAR_TIME_ZONE,
+                )
+                logging.info("Tool %s completed successfully", call.name)
                 messages.append(
                     {
                         "role": "tool",
                         "name": call.name,
-                        "content": execute_tool_call(
-                            call,
-                            RETRIEVAL_DATABASE,
-                            GOOGLE_CALENDAR_CREDENTIALS,
-                            GOOGLE_CALENDAR_TOKEN,
-                            GOOGLE_CALENDAR_IDS,
-                            GOOGLE_CALENDAR_TIME_ZONE,
-                        ),
+                        "content": tool_result,
                     }
                 )
             messages = self._fit_messages(messages, TOOL_SCHEMAS)
@@ -410,11 +430,7 @@ async def generation_worker() -> None:
             )
             prompt = [
                 {
-                    "content": (
-                        relationship_system_message(request.relationship)
-                        + f" Текущая дата и время: {current_time}. "
-                        "Для относительных дат используй это время."
-                    ),
+                    "content": live_system_message(request.relationship, current_time),
                     "role": "system",
                 },
                 *history[-MAX_HISTORY_TURNS * 2 :],

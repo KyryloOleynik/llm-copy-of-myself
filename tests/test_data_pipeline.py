@@ -232,6 +232,17 @@ def test_context_and_reasoning_supplements_are_deterministic_and_disjoint():
     assert all(row["source_type"] == "instruction_following" for row in instructions)
     assert any(row["messages"][-1]["content"].startswith("{") for row in instructions)
     assert all(row["tools"] != "[]" for row in tool_rows + rag_rows)
+    assert all(row["supervise_all_assistant_turns"] for row in tool_rows + rag_rows)
+    assert all(
+        [message["role"] for message in row["messages"]]
+        == ["system", "user", "assistant", "tool", "assistant"]
+        for row in tool_rows + rag_rows
+    )
+    assert all(
+        json.loads(row["messages"][2]["tool_calls"])
+        and row["messages"][4]["content"]
+        for row in tool_rows + rag_rows
+    )
     all_rows = (
         context_train
         + context_test

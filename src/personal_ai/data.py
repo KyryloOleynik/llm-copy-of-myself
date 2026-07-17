@@ -225,6 +225,7 @@ def _build_session_examples(
                 "target_message_ids": target["source_message_ids"],
                 "sequence_tokens": sequence_tokens,
                 "target_tokens": target_tokens,
+                "supervise_all_assistant_turns": False,
                 "messages": normalize_messages_for_storage(messages),
                 "tools": "[]",
             }
@@ -336,46 +337,56 @@ def _validate_synthetic_examples(rows: list[dict[str, Any]]) -> dict[str, int]:
         if row["source_type"] in {"tool_calling", "rag_retrieval"}:
             if not json.loads(row.get("tools", "[]")):
                 raise ValueError(f"{row['example_id']} is missing native tool definitions")
-            target_calls = json.loads(messages[-1].get("tool_calls", "[]"))
-            if not target_calls:
-                tool_messages = [message for message in messages if message["role"] == "tool"]
-                prior_calls = [
-                    message
-                    for message in messages[:-1]
-                    if message["role"] == "assistant"
-                    and json.loads(message.get("tool_calls", "[]"))
-                ]
-                if not tool_messages or not prior_calls:
-                    raise ValueError(
-                        f"{row['example_id']} must contain a tool call and returned result"
-                    )
-                returned_text = " ".join(
-                    message["content"] for message in tool_messages
-                ).casefold()
-                answer_text = messages[-1]["content"].casefold()
-                returned_terms = set(re.findall(r"[\w-]{3,}", returned_text)) | set(
-                    re.findall(r"\d{1,2}:\d{2}", returned_text)
+            if not row.get("supervise_all_assistant_turns"):
+                raise ValueError(f"{row['example_id']} does not supervise the complete tool loop")
+            tool_messages = [message for message in messages if message["role"] == "tool"]
+            prior_calls = [
+                message
+                for message in messages[:-1]
+                if message["role"] == "assistant"
+                and json.loads(message.get("tool_calls", "[]"))
+            ]
+            if (
+                not tool_messages
+                or not prior_calls
+                or messages[-1]["role"] != "assistant"
+                or not messages[-1]["content"].strip()
+                or json.loads(messages[-1].get("tool_calls", "[]"))
+            ):
+                raise ValueError(
+                    f"{row['example_id']} must contain call, tool result, and final answer"
                 )
-                answer_terms = set(re.findall(r"[\w-]{3,}", answer_text)) | set(
-                    re.findall(r"\d{1,2}:\d{2}", answer_text)
-                )
-                empty_result = all(
-                    not json.loads(message["content"]).get("results")
-                    for message in tool_messages
-                    if message.get("name") == "search_personal_memory"
-                ) if all(
-                    message.get("name") == "search_personal_memory"
-                    for message in tool_messages
-                ) else False
-                if empty_result:
-                    if not {"ничего", "нашел", "нашёл"} & answer_terms:
-                        raise ValueError(
-                            f"{row['example_id']} does not answer an empty tool result"
-                        )
-                elif not returned_terms & answer_terms:
+            returned_text = " ".join(
+                message["content"] for message in tool_messages
+            ).casefold()
+            answer_text = messages[-1]["content"].casefold()
+            returned_terms = set(re.findall(r"[\w-]{3,}", returned_text)) | set(
+                re.findall(r"\d{1,2}:\d{2}", returned_text)
+            ) | set(
+                re.findall(r"-?\d+(?:\.\d+)?", returned_text)
+            )
+            answer_terms = set(re.findall(r"[\w-]{3,}", answer_text)) | set(
+                re.findall(r"\d{1,2}:\d{2}", answer_text)
+            ) | set(
+                re.findall(r"-?\d+(?:\.\d+)?", answer_text)
+            )
+            empty_result = all(
+                not json.loads(message["content"]).get("results")
+                for message in tool_messages
+                if message.get("name") == "search_personal_memory"
+            ) if all(
+                message.get("name") == "search_personal_memory"
+                for message in tool_messages
+            ) else False
+            if empty_result:
+                if not {"ничего", "нашел", "нашёл"} & answer_terms:
                     raise ValueError(
-                        f"{row['example_id']} final answer is not grounded in its tool result"
+                        f"{row['example_id']} does not answer an empty tool result"
                     )
+            elif not returned_terms & answer_terms:
+                raise ValueError(
+                    f"{row['example_id']} final answer is not grounded in its tool result"
+                )
     return {
         "examples": len(synthetic),
         "unique_conversations": len(fingerprints),

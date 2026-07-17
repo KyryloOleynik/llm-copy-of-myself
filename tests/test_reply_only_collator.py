@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from personal_ai.training import IGNORE_INDEX, ReplyOnlyCollator, write_smoke_sample_audit
-from personal_ai.utils import assistant_target_ids
+from personal_ai.utils import assistant_target_ids, assistant_target_spans
 from tests.helpers import FakeTokenizer
 
 
@@ -23,6 +23,67 @@ def test_only_final_reply_has_labels():
     assert labels[: len(prompt)] == [IGNORE_INDEX] * len(prompt)
     assert labels[len(prompt) :] == full[len(prompt) :]
     assert collator.audit["zero_label_example"] == 0
+
+
+def test_one_tool_chat_trains_call_and_post_tool_answer():
+    tokenizer = FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "style"},
+        {"role": "user", "content": "посчитай 2+2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calculate",
+                        "arguments": {"expression": "2+2"},
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "name": "calculate", "content": '{"result": 4}'},
+        {"role": "assistant", "content": "получается 4"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "calculate",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    full, spans = assistant_target_spans(tokenizer, messages, tools)
+    collator = ReplyOnlyCollator(tokenizer, max_length=1000)
+
+    batch = collator(
+        [
+            {
+                "messages": messages,
+                "tools": json.dumps(tools),
+                "supervise_all_assistant_turns": True,
+            }
+        ]
+    )
+
+    labels = batch["labels"][0].tolist()
+    expected = [IGNORE_INDEX] * len(full)
+    for start, end in spans:
+        expected[start:end] = full[start:end]
+    assert labels == expected
+    assert len(spans) == 2
+    assert all(labels[start:end] == full[start:end] for start, end in spans)
+    tool_result_start = tokenizer.apply_chat_template(
+        messages[:3], True, False, tools=tools
+    )
+    final_prompt_end = tokenizer.apply_chat_template(
+        messages[:4], True, True, tools=tools
+    )
+    assert labels[len(tool_result_start) : len(final_prompt_end)] == [
+        IGNORE_INDEX
+    ] * (len(final_prompt_end) - len(tool_result_start))
 
 
 def test_smoke_audit_identifies_masked_prompt_and_expected_reply():

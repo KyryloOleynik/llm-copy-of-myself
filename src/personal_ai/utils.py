@@ -157,6 +157,43 @@ def assistant_target_ids(
     return prompt_ids, full_ids, target_ids
 
 
+def assistant_target_spans(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    tools: str | list[dict[str, Any]] | None = None,
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Return the complete chat and exact token spans for every assistant turn."""
+    if not messages or messages[-1]["role"] != "assistant":
+        raise ValueError("Every example must end with an assistant target")
+    full_ids = render_chat_ids(tokenizer, messages, generation=False, tools=tools)
+    spans: list[tuple[int, int]] = []
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+        prompt_ids = render_chat_ids(
+            tokenizer,
+            messages[:index],
+            generation=True,
+            tools=tools,
+        )
+        through_target_ids = render_chat_ids(
+            tokenizer,
+            messages[: index + 1],
+            generation=False,
+            tools=tools,
+        )
+        if through_target_ids[: len(prompt_ids)] != prompt_ids:
+            raise ValueError("Assistant prompt is not a prefix of its completed turn")
+        if full_ids[: len(through_target_ids)] != through_target_ids:
+            raise ValueError("Assistant turn is not a prefix of the complete conversation")
+        if len(through_target_ids) == len(prompt_ids):
+            raise ValueError("Assistant turn has no trainable target tokens")
+        spans.append((len(prompt_ids), len(through_target_ids)))
+    if not spans:
+        raise ValueError("Example has no assistant target")
+    return full_ids, spans
+
+
 def relationship_system_message(relationship: str) -> str:
     """Return the persona prompt shared by preparation and inference."""
     return (

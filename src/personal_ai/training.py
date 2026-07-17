@@ -15,6 +15,7 @@ from personal_ai.config import AppConfig
 from personal_ai.modeling import load_quantized_base, load_tokenizer, select_language_lora_modules
 from personal_ai.utils import (
     assistant_target_ids,
+    assistant_target_spans,
     assistant_target_text,
     iter_jsonl,
     read_json,
@@ -157,7 +158,7 @@ def _save_interrupted_checkpoint(trainer: Any, tokenizer: Any, output_dir: Path)
 
 @dataclass
 class ReplyOnlyCollator:
-    """Tokenize chat examples and compute loss only on the final assistant reply."""
+    """Tokenize chats and supervise the configured assistant turns only."""
 
     tokenizer: Any
     max_length: int
@@ -184,31 +185,53 @@ class ReplyOnlyCollator:
         for example in examples:
             messages = example["messages"]
             tools = example.get("tools", "[]")
+            supervise_all = bool(example.get("supervise_all_assistant_turns", False))
             if not messages or messages[0].get("role") != "system":
                 self.audit["missing_system_prompt"] += 1
                 raise ValueError("Every training example must start with a system prompt")
+            truncation_strategy = "none"
+            truncated_prompt_tokens = 0
+            target_spans: list[tuple[int, int]]
             try:
-                prompt_ids, full_ids, target_ids = assistant_target_ids(
-                    self.tokenizer,
-                    messages,
-                    tools,
-                )
+                if supervise_all:
+                    full_ids, target_spans = assistant_target_spans(
+                        self.tokenizer,
+                        messages,
+                        tools,
+                    )
+                    prompt_ids = full_ids[: target_spans[0][0]]
+                    target_ids = [
+                        token
+                        for start, end in target_spans
+                        for token in full_ids[start:end]
+                    ]
+                else:
+                    prompt_ids, full_ids, target_ids = assistant_target_ids(
+                        self.tokenizer,
+                        messages,
+                        tools,
+                    )
+                    target_spans = [(len(prompt_ids), len(full_ids))]
             except ValueError as exc:
                 if "prefix" in str(exc):
                     self.audit["prompt_prefix_mismatch"] += 1
                 else:
                     self.audit["zero_label_example"] += 1
                 raise
-            if len(target_ids) > self.max_target_tokens:
+            target_lengths = [end - start for start, end in target_spans]
+            if any(length > self.max_target_tokens for length in target_lengths):
                 self.audit["oversized_target"] += 1
                 raise ValueError(
-                    f"Assistant target has {len(target_ids)} tokens; "
+                    f"Assistant target has {max(target_lengths)} tokens; "
                     f"maximum is {self.max_target_tokens}"
                 )
             original_sequence_tokens = len(full_ids)
-            truncation_strategy = "none"
-            truncated_prompt_tokens = 0
-            if len(full_ids) > self.max_length:
+            if supervise_all and len(full_ids) > self.max_length:
+                self.audit["target_cannot_fit"] += 1
+                raise ValueError(
+                    "A complete multi-turn tool conversation exceeds the sequence budget"
+                )
+            if not supervise_all and len(full_ids) > self.max_length:
                 try:
                     prompt_ids, truncated_prompt_tokens, truncation_strategy = (
                         truncate_prompt_tokens(
@@ -226,7 +249,10 @@ class ReplyOnlyCollator:
                 full_ids = prompt_ids + target_ids
                 self.audit["truncated_examples"] += 1
                 self.audit["truncated_prompt_tokens"] += truncated_prompt_tokens
-            labels = [IGNORE_INDEX] * len(prompt_ids) + target_ids
+                target_spans = [(len(prompt_ids), len(full_ids))]
+            labels = [IGNORE_INDEX] * len(full_ids)
+            for start, end in target_spans:
+                labels[start:end] = full_ids[start:end]
             self.audit["examples"] += 1
             self.audit["target_tokens"] += len(target_ids)
             if self.capture_examples:
@@ -242,7 +268,10 @@ class ReplyOnlyCollator:
                         "timestamp": str(example.get("timestamp", "")),
                         "masked_prompt_messages": messages[:-1],
                         "expected_assistant_reply": assistant_target_text(messages),
-                        "masked_prompt_tokens": len(prompt_ids),
+                        "supervision_mode": "all_assistant_turns" if supervise_all else "final",
+                        "supervised_assistant_turns": len(target_spans),
+                        "supervised_token_spans": [list(span) for span in target_spans],
+                        "masked_prompt_tokens": labels.count(IGNORE_INDEX),
                         "trained_target_tokens": len(target_ids),
                         "total_sequence_tokens": len(full_ids),
                         "original_sequence_tokens": original_sequence_tokens,
@@ -465,6 +494,7 @@ def prepared_dataset_features() -> Any:
             "target_tokens": Value("int64"),
             "timestamp": Value("string"),
             "tools": Value("string"),
+            "supervise_all_assistant_turns": Value("bool"),
         }
     )
 
