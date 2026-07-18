@@ -8,6 +8,7 @@ __pycache__/
 .env
 config.yaml
 DataExport_*/
+.env
 private_data/
 data/bot.sqlite3
 data/retrieval.sqlite3
