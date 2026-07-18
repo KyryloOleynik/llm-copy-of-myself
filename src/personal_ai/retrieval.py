@@ -18,6 +18,9 @@ from personal_ai.config import AppConfig
 SUPPORTED_KNOWLEDGE_SUFFIXES = {".json", ".jsonl", ".md", ".txt"}
 VECTOR_SCHEMA_VERSION = "2"
 RRF_K = 60
+CURATED_KNOWLEDGE_MAX_SIMILARITY_GAP = 0.08
+TELEGRAM_SESSION_GAP_SECONDS = 12 * 60 * 60
+_RESIDENT_EMBEDDING_MODELS: dict[tuple[str, str], Any] = {}
 
 
 def _json_strings(value: Any) -> Iterator[str]:
@@ -111,6 +114,50 @@ def _telegram_documents(cleaned_path: Path) -> Iterator[tuple[str, str]]:
                 yield source, "\n".join(lines)
 
 
+def _raw_telegram_documents(export_path: Path) -> Iterator[tuple[str, str]]:
+    """Yield session documents from every chat type in a Telegram Desktop export."""
+    if not export_path.is_file():
+        return
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    for chat in exported.get("chats", {}).get("list", []):
+        chat_id = str(chat.get("id") or "unknown")
+        chat_type = str(chat.get("type") or "unknown")
+        chat_name = str(chat.get("name") or chat_id)
+        session_index = 0
+        yielded_document = False
+        current_lines = [f"Тип чата: {chat_type}", f"Чат: {chat_name}"]
+        previous_timestamp: int | None = None
+        for message in chat.get("messages", []):
+            timestamp_value = message.get("date_unixtime")
+            timestamp = int(timestamp_value) if timestamp_value is not None else None
+            if (
+                timestamp is not None
+                and previous_timestamp is not None
+                and timestamp - previous_timestamp > TELEGRAM_SESSION_GAP_SECONDS
+            ):
+                if len(current_lines) > 2:
+                    source = (
+                        f"telegram/{chat_type}/{chat_id}/session_{session_index:04d}"
+                    )
+                    yield source, "\n".join(current_lines)
+                    yielded_document = True
+                    session_index += 1
+                current_lines = [f"Тип чата: {chat_type}", f"Чат: {chat_name}"]
+            text = _message_text(message)
+            if text:
+                speaker = str(message.get("from") or message.get("from_id") or "unknown")
+                current_lines.append(f"{speaker}: {text}")
+            if timestamp is not None:
+                previous_timestamp = timestamp
+        if len(current_lines) > 2:
+            source = f"telegram/{chat_type}/{chat_id}/session_{session_index:04d}"
+            yield source, "\n".join(current_lines)
+            yielded_document = True
+        if not yielded_document:
+            source = f"telegram/{chat_type}/{chat_id}/session_0000"
+            yield source, "\n".join(current_lines)
+
+
 def _chunks(
     documents: Iterable[tuple[str, str]], max_chars: int, overlap_chars: int
 ) -> Iterator[tuple[str, str]]:
@@ -171,11 +218,31 @@ def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
         ) from exc
 
 
+def preload_retrieval_embedding_model(database: Path) -> dict[str, str]:
+    """Load and retain the embedding model declared by an existing RAG index."""
+    if not database.is_file():
+        raise FileNotFoundError(f"RAG index is missing: {database}. Run personal-ai build-rag.")
+    with closing(sqlite3.connect(database)) as connection:
+        metadata = _metadata(connection)
+    model_name = metadata["embedding_model"]
+    device = metadata.get("embedding_device", "cpu")
+    model = _embedding_model(model_name, device)
+    _RESIDENT_EMBEDDING_MODELS[(model_name, device)] = model
+    return {
+        "embedding_model": model_name,
+        "embedding_device": device,
+    }
+
+
 def build_retrieval_index(config: AppConfig) -> dict[str, int]:
     """Build private dense-vector and keyword indexes from local personal knowledge."""
     documents = list(_knowledge_documents(config.retrieval.knowledge_dir))
     if config.retrieval.include_cleaned_telegram:
-        documents.extend(_telegram_documents(config.data.cleaned))
+        raw_export = getattr(config.data, "source", None)
+        if isinstance(raw_export, Path) and raw_export.is_file():
+            documents.extend(_raw_telegram_documents(raw_export))
+        else:
+            documents.extend(_telegram_documents(config.data.cleaned))
     chunks = list(
         _chunks(
             documents,
@@ -350,7 +417,37 @@ def search_retrieval(database: Path, query: str, limit: int = 5) -> list[dict[st
         fused[chunk_id] = score
 
     positions = {chunk_id: index for index, chunk_id in enumerate(chunk_ids)}
-    ranked_ids = sorted(fused, key=fused.get, reverse=True)[:bounded_limit]
+    fused_ids = sorted(fused, key=fused.get, reverse=True)
+    ranked_ids = fused_ids[:bounded_limit]
+    if bounded_limit >= 2:
+        knowledge_positions = [
+            index
+            for index, source in enumerate(sources)
+            if source.startswith("knowledge/")
+        ]
+        if knowledge_positions:
+            best_similarity = float(similarities.max())
+            knowledge_positions.sort(
+                key=lambda index: float(similarities[index]),
+                reverse=True,
+            )
+            knowledge_slots = min(2, bounded_limit // 2)
+            reserved_knowledge_ids = [
+                chunk_ids[index]
+                for index in knowledge_positions
+                if best_similarity - float(similarities[index])
+                <= CURATED_KNOWLEDGE_MAX_SIMILARITY_GAP
+            ][:knowledge_slots]
+            for rank, chunk_id in enumerate(reserved_knowledge_ids, start=1):
+                fused.setdefault(
+                    chunk_id,
+                    vector_weight / (RRF_K + rank),
+                )
+            ranked_ids = reserved_knowledge_ids + [
+                chunk_id
+                for chunk_id in fused_ids
+                if chunk_id not in reserved_knowledge_ids
+            ][: bounded_limit - len(reserved_knowledge_ids)]
     results: list[dict[str, Any]] = []
     for chunk_id in ranked_ids:
         position = positions[chunk_id]
@@ -366,6 +463,11 @@ def search_retrieval(database: Path, query: str, limit: int = 5) -> list[dict[st
                     else None
                 ),
                 "retrieval": "hybrid_vector_keyword",
+                "source_priority": (
+                    "curated_knowledge"
+                    if sources[position].startswith("knowledge/")
+                    else "conversation_memory"
+                ),
             }
         )
     return results

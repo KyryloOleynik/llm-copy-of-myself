@@ -137,10 +137,11 @@ Personal style examples are supplemented with deterministic context-retention, r
 
 ### Hybrid semantic RAG
 
-Knowledge files and cleaned Telegram sessions are split into overlapping chunks and
-embedded locally with `intfloat/multilingual-e5-small`. Retrieval combines cosine
-vector similarity with SQLite BM25 keyword ranking, preserving semantic matches as
-well as exact names, dates, and codes.
+Knowledge files and every chat in the raw Telegram export are split into overlapping
+chunks and embedded locally with `intfloat/multilingual-e5-small`. The embedding model
+is loaded once after the main LLM and remains resident while the bot is running.
+Retrieval combines cosine vector similarity with SQLite BM25 keyword ranking, so it
+can find semantic matches as well as exact names, dates, and codes.
 
 ### Acceptance gate
 
@@ -159,14 +160,16 @@ An adapter is accepted only after it:
 ```powershell
 New-Item -ItemType Directory -Force private_data
 Copy-Item .\DataExport_2026-07-17\result.json .\private_data\result.json
+Copy-Item .\.env.example .\.env
 Copy-Item .\config.example.yaml .\config.yaml
 Copy-Item .\relationships.example.json .\private_data\relationships.json
 ```
 
 Keep the original export. Before processing, set the correct `owner_from_id` and
-paths in `config.yaml`, complete `private_data/relationships.json`, verify free disk
-space, and obtain consent for messages used in training. Put identity/story notes not
-present in Telegram under `private_data/knowledge/`. Media files are not required.
+paths in `config.yaml`, set `BOT_TOKEN` in `.env`, complete
+`private_data/relationships.json`, verify free disk space, and obtain consent for
+messages used in training. Put identity/story notes not present in Telegram under
+`private_data/knowledge/`. Media files are not required.
 
 ### 2. Install and verify CUDA
 
@@ -198,14 +201,28 @@ Use `personal-ai train --fresh` for a new run or `--resume last` to resume.
 The bot:
 
 - loads the quantized base model and adapter once;
+- loads and keeps the multilingual RAG embedding model resident;
 - serializes GPU generation through an async queue;
 - keeps bounded per-chat history;
-- reads events and free time from the authorized Google Calendar;
+- deterministically routes identity and people questions to personal-memory RAG;
+- routes recent activity, plans, events, and availability to Google Calendar;
+- routes arithmetic to the calculator, including arithmetic inside mixed questions;
+- executes all required tools before asking the model for its styled final answer;
+- stores tool calls and results in the same conversation turn for grounded follow-ups;
+- includes the current date, weekday, timezone, and week boundaries in live context;
+- logs every tool call and returned result to the console;
 - batches rapidly arriving messages;
 - converts unsupported media into stable text placeholders;
 - conditions responses on the selected relationship type;
 - stores lightweight state in SQLite;
 - refuses an unaccepted adapter unless explicitly overridden.
+
+Tool routing is enforced by live runtime code, not only by the system prompt. For
+example, `Расскажи о себе` always searches personal memory, `Что делал на этой
+неделе?` reads Calendar events from Monday through the current time, and a mixed
+question such as `Где живёшь и сколько будет 2+2?` runs both RAG and the calculator
+before producing one answer. This enforcement is currently limited to live chat and
+does not alter training examples.
 
 Supported commands:
 

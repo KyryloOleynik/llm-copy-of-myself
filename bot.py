@@ -11,7 +11,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,7 +31,8 @@ from personal_ai.modeling import (
     load_inference_model,
     personal_style_generation_options,
 )
-from personal_ai.tools import TOOL_SCHEMAS, execute_tool_call, parse_tool_calls
+from personal_ai.retrieval import preload_retrieval_embedding_model
+from personal_ai.tools import TOOL_SCHEMAS, ToolCall, execute_tool_call, parse_tool_calls
 from personal_ai.utils import load_dotenv, read_json, relationship_system_message, render_chat_ids
 
 
@@ -54,7 +55,7 @@ MAX_REPLY_DELAY = float(os.getenv("MAX_REPLY_DELAY", "60"))
 READING_CHARS_PER_SECOND = float(os.getenv("READING_CHARS_PER_SECOND", "35"))
 TYPING_WORDS_PER_MINUTE = float(os.getenv("TYPING_WORDS_PER_MINUTE", "42"))
 MAX_POST_GENERATION_DELAY = float(os.getenv("MAX_POST_GENERATION_DELAY", "5"))
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "96"))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "192"))
 MAX_REPLY_PARTS = int(os.getenv("MAX_REPLY_PARTS", "4"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "30"))
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
@@ -97,26 +98,238 @@ RELATIONSHIPS = {
 dp = Dispatcher()
 model: "LocalModel | None" = None
 pending_chats: dict[int, "PendingChat"] = {}
-chat_history: dict[int, list[dict[str, str]]] = {}
+chat_history: dict[int, list[dict[str, object]]] = {}
 generation_queue: asyncio.Queue["GenerationRequest"] | None = None
 user_relationships: dict[int, str] = {}
+
+_ARITHMETIC_EXPRESSION = re.compile(
+    r"(?<![\w.])[-+]?(?:\d+(?:[.,]\d+)?|\.\d+)"
+    r"(?:\s*(?:\*\*|//|[+\-*/%])\s*[-+]?(?:\d+(?:[.,]\d+)?|\.\d+))+"
+    r"(?![\w.])"
+)
+_IDENTITY_REQUEST = re.compile(
+    r"\b(?:расскажи\s+о\s+себе|кто\s+ты|о\s+себе|"
+    r"где\s+жив(?:ёшь|ешь)|откуда\s+ты|сколько\s+тебе\s+лет|"
+    r"tell\s+me\s+about\s+yourself|who\s+are\s+you|where\s+do\s+you\s+live)\b"
+)
+_PEOPLE_REQUEST = re.compile(
+    r"\b(?:кто\s+(?:такой|такая|такие)|с\s+кем|"
+    r"who\s+(?:is|are)|отношени\w*\s+с|relationship\s+with)\b"
+)
+_EXPLICIT_MEMORY_REQUEST = re.compile(
+    r"\b(?:поищ\w*|ищи|искал\w*|искать|поиск\w*|памят\w*|"
+    r"используй\s+(?:тул\w*|инструмент\w*)|search|use\s+(?:the\s+)?tools?)\b"
+)
+_CALENDAR_REQUEST = re.compile(
+    r"\b(?:календар\w*|расписан\w*|план\w*|событи\w*|встреч\w*|"
+    r"свобод\w*|занят\w*|делал\w*|делаешь|делаеш|будешь\s+делать|"
+    r"гулял\w*|недел\w*|тижн\w*|сегодня|завтра|вчера|"
+    r"calendar|schedule|plans?|events?|meetings?|free|busy|"
+    r"today|tomorrow|yesterday|this\s+week|last\s+week|next\s+week)\b"
+)
+_PAST_ACTIVITY = re.compile(
+    r"\b(?:делал\w*|был\w*|гулял\w*|занимал\w*|вчера|прошл\w*|"
+    r"минул\w*|did|was|went|yesterday|last\s+week)\b"
+)
+_FREE_TIME_REQUEST = re.compile(
+    r"\b(?:свобод\w*|доступ\w*|окн\w*|free|available|availability)\b"
+)
 
 
 def live_system_message(relationship: str, current_time: str) -> str:
     """Add an explicit tool policy only to live bot conversations."""
+    current_datetime = datetime.fromisoformat(current_time)
+    current_date = current_datetime.date().isoformat()
+    week_start = (current_datetime - timedelta(days=current_datetime.weekday())).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    week_end = week_start + timedelta(days=7)
+    weekday = (
+        "понедельник",
+        "вторник",
+        "среда",
+        "четверг",
+        "пятница",
+        "суббота",
+        "воскресенье",
+    )[current_datetime.weekday()]
     return (
         relationship_system_message(relationship)
-        + " Тебе доступны инструменты: calculate для точных вычислений, "
-        "search_personal_memory для личных фактов и истории, "
-        "query_google_calendar для расписания и свободного времени. "
-        "Если вопрос требует этих данных, ОБЯЗАТЕЛЬНО сначала сделай нативный "
-        "вызов подходящего инструмента вместо ответа по памяти или догадки. "
-        "Не описывай вызов словами и не придумывай результат. После получения "
-        "результата инструмента ответь в своём обычном стиле только по этим данным. "
-        "Если данных нет или инструмент вернул ошибку, прямо скажи об этом."
-        f" Текущая дата и время: {current_time}. "
-        "Для относительных дат используй это время."
+        + " Ты находишься в live-чате и можешь свободно и активно использовать инструменты. "
+        "При любой полезной возможности лучше вызвать подходящий инструмент, чем отвечать "
+        "по догадке. КРИТИЧЕСКИЙ ЦИКЛ: если нужен инструмент, твой первый ответ должен "
+        "содержать только вызов инструмента. Запрещено вместо вызова писать «посмотрю», "
+        "«проверю», «окей, посмотрим», «сейчас узнаю» или обещать ответить позже. После "
+        "сообщения role=tool сразу дай пользователю законченный ответ по результату в этом "
+        "же ходе. Пользователь не видит служебные вызовы и JSON, поэтому обычный ответ "
+        "после результата обязателен. Для каждого нового фактического вопроса делай свежий "
+        "подходящий вызов; не повторяй старый результат из истории, если пользователь прямо "
+        "не спрашивает, что вернул прошлый инструмент. "
+        "МАРШРУТИЗАЦИЯ: ОБЯЗАТЕЛЬНО используй search_personal_memory для «расскажи о "
+        "себе», «кто ты», вопросов о личности, биографии, семье, отношениях, людях, местах, "
+        "предпочтениях, прошлом, проектах, знаниях или истории Родиона и когда не уверен "
+        "в личном факте. Для общего вопроса о себе ищи широким двуязычным запросом про "
+        "identity, biography, family, location, studies, work, projects and interests. "
+        "Для вопроса о названных людях включи в запрос все имена без изменения и используй "
+        "только результаты, где эти люди упомянуты явно. ОБЯЗАТЕЛЬНО используй "
+        "query_google_calendar для того, что Родион делал, делает или будет делать сегодня, "
+        "вчера, завтра, на этой или другой неделе, а также для планов, событий, встреч, "
+        "занятости и свободного времени. Вопрос «что делал на этой неделе?» означает "
+        "calendar action=events от начала текущей недели до текущего времени, а не поиск "
+        "в памяти. ОБЯЗАТЕЛЬНО используй calculate для точной арифметики, процентов, "
+        "сравнения чисел и преобразования величин. Можно вызвать несколько инструментов, "
+        "если вопрос действительно требует разных источников. Не вызывай их только для "
+        "простого приветствия или чистого мнения без фактов. "
+        "ФОРМАТ ВЫЗОВА строго такой: "
+        '<tool_call>{\"name\":\"ИМЯ_ИНСТРУМЕНТА\",\"arguments\":{...}}</tool_call>. '
+        "Один блок на вызов, без Markdown, пояснений и обычного текста рядом. Для "
+        "calculate передавай "
+        '{\"expression\":\"арифметическое выражение\"}; результат имеет вид '
+        '{\"result\":число}. Для search_personal_memory передавай '
+        '{\"query\":\"конкретный поисковый запрос\",\"limit\":5}; для русских или '
+        "украинских вопросов добавляй в query полезные английские эквиваленты, потому "
+        "что личные заметки могут быть на английском. Результат содержит "
+        '{\"results\":[{\"source\":\"...\",\"content\":\"...\",\"score\":...}]}; '
+        "прочитай content всех релевантных результатов. "
+        "Для query_google_calendar передавай action=events, если нужны события, или "
+        "action=free_time, если нужна доступность; start и end всегда передавай как "
+        "ISO-8601 с часовым поясом, а при необходимости также query, "
+        "minimum_free_minutes и limit. Результат events содержит events со summary, "
+        "start, end и location; результат free_time содержит busy и free. "
+        "ПРАВИЛА РЕЗУЛЬТАТА: отвечай только по релевантным возвращённым данным. Если "
+        "results не пуст, нельзя говорить, что поиск ничего не нашёл; кратко перескажи "
+        "релевантное и честно отдели известное от неизвестного. Если results пуст, скажи, "
+        "что память ничего не нашла, и не добавляй фактов. Не придумывай ссылки, репозитории, "
+        "имена, возраст, город, родственников или другие детали; ссылку можно назвать "
+        "только если она дословно есть в content. В Telegram-чанках различай говорящих: "
+        "реплика другого человека не является фактом о Родионе. Один случайный фрагмент "
+        "не доказывает, кем человек приходится Родиону. Пустой events означает только "
+        "«в календаре нет записанных событий», а не «ничего не делал». Не называй Родиона "
+        "полностью свободным по events: для доступности используй free_time. Если инструмент "
+        "вернул ошибку, прямо скажи об этом. Если пользователь спрашивает точный прошлый "
+        "результат, перескажи сохранённый role=tool без выдумок. "
+        f"КОНТЕКСТ ВРЕМЕНИ: текущая дата: {current_date}. "
+        f"Текущий день недели: {weekday}. "
+        f"Текущая дата и время с часовым поясом: {current_time}. "
+        f"Текущая неделя: от {week_start.isoformat()} до {week_end.isoformat()}. "
+        "Для всех относительных дат используй этот контекст."
     )
+
+
+def _calendar_window(text: str, current_datetime: datetime) -> tuple[datetime, datetime]:
+    normalized = text.casefold()
+    today = current_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today - timedelta(days=current_datetime.weekday())
+    past_activity = bool(_PAST_ACTIVITY.search(normalized))
+
+    if re.search(
+        r"\b(?:прошл\w*\s+недел\w*|минул\w*\s+тижн\w*|last\s+week)\b",
+        normalized,
+    ):
+        return week_start - timedelta(days=7), week_start
+    if re.search(
+        r"\b(?:следующ\w*\s+недел\w*|наступн\w*\s+тижн\w*|next\s+week)\b",
+        normalized,
+    ):
+        return week_start + timedelta(days=7), week_start + timedelta(days=14)
+    if re.search(
+        r"\b(?:эт\w*\s+недел\w*|цьо\w*\s+тижн\w*|this\s+week)\b",
+        normalized,
+    ):
+        return week_start, current_datetime if past_activity else week_start + timedelta(days=7)
+    if re.search(r"\b(?:позавчера|day\s+before\s+yesterday)\b", normalized):
+        return today - timedelta(days=2), today - timedelta(days=1)
+    if re.search(r"\b(?:вчера|yesterday)\b", normalized):
+        return today - timedelta(days=1), today
+    if re.search(r"\b(?:завтра|tomorrow)\b", normalized):
+        return today + timedelta(days=1), today + timedelta(days=2)
+    if re.search(r"\b(?:сегодня|today)\b", normalized):
+        return today, current_datetime if past_activity else today + timedelta(days=1)
+    if past_activity:
+        return current_datetime - timedelta(days=7), current_datetime
+    return current_datetime, current_datetime + timedelta(days=7)
+
+
+def _memory_query(
+    incoming: str,
+    history: list[dict[str, object]],
+    *,
+    broad_identity: bool,
+    explicit_search: bool,
+) -> str:
+    if explicit_search:
+        recent_requests = [
+            str(message.get("content", "")).strip()
+            for message in history
+            if message.get("role") == "user" and str(message.get("content", "")).strip()
+        ][-4:]
+        context = " | ".join(recent_requests)
+    else:
+        context = incoming.strip()
+    if broad_identity:
+        context += (
+            " | Rodion identity biography full name location family studies work "
+            "projects interests personal story"
+        )
+    return context
+
+
+def required_live_tool_calls(
+    incoming: str,
+    history: list[dict[str, object]],
+    current_time: str,
+) -> tuple[ToolCall, ...]:
+    """Deterministically route factual live-chat requests before model generation."""
+    normalized = incoming.casefold()
+    calls: list[ToolCall] = []
+    broad_identity = bool(_IDENTITY_REQUEST.search(normalized))
+    people_request = bool(_PEOPLE_REQUEST.search(normalized))
+    explicit_search = bool(_EXPLICIT_MEMORY_REQUEST.search(normalized))
+
+    if broad_identity or people_request or explicit_search:
+        calls.append(
+            ToolCall(
+                "search_personal_memory",
+                {
+                    "query": _memory_query(
+                        incoming,
+                        history,
+                        broad_identity=broad_identity,
+                        explicit_search=explicit_search,
+                    ),
+                    "limit": 8 if broad_identity else 5,
+                },
+            )
+        )
+
+    if _CALENDAR_REQUEST.search(normalized):
+        current_datetime = datetime.fromisoformat(current_time)
+        start, end = _calendar_window(normalized, current_datetime)
+        calls.append(
+            ToolCall(
+                "query_google_calendar",
+                {
+                    "action": (
+                        "free_time" if _FREE_TIME_REQUEST.search(normalized) else "events"
+                    ),
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "limit": 50,
+                },
+            )
+        )
+
+    for match in _ARITHMETIC_EXPRESSION.finditer(incoming):
+        calls.append(
+            ToolCall(
+                "calculate",
+                {"expression": match.group(0).replace(",", ".").replace(" ", "")},
+            )
+        )
+    return tuple(calls)
 
 
 def _has_adapter_weights(path: Path) -> bool:
@@ -332,8 +545,57 @@ class LocalModel:
                 raise ValueError("System prompt and latest tool interaction exceed context budget")
             del fitted[1:next_user]
 
-    def generate(self, messages: list[dict[str, object]]) -> str:
+    def _run_tools(
+        self,
+        messages: list[dict[str, object]],
+        calls: tuple[ToolCall, ...] | list[ToolCall],
+        tool_trace: list[dict[str, object]],
+    ) -> None:
+        assistant_call_message = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                }
+                for call in calls
+            ],
+        }
+        messages.append(assistant_call_message)
+        tool_trace.append(assistant_call_message)
+        for call in calls:
+            logging.info("Using tool %s with arguments %r", call.name, call.arguments)
+            tool_result = execute_tool_call(
+                call,
+                RETRIEVAL_DATABASE,
+                GOOGLE_CALENDAR_CREDENTIALS,
+                GOOGLE_CALENDAR_TOKEN,
+                GOOGLE_CALENDAR_IDS,
+                GOOGLE_CALENDAR_TIME_ZONE,
+            )
+            logging.info("Tool %s result: %s", call.name, tool_result)
+            tool_message = {
+                "role": "tool",
+                "name": call.name,
+                "content": tool_result,
+            }
+            messages.append(tool_message)
+            tool_trace.append(tool_message)
+
+    def generate(
+        self,
+        messages: list[dict[str, object]],
+        required_tool_calls: tuple[ToolCall, ...] = (),
+    ) -> "ModelGeneration":
         messages = self._fit_messages(messages, TOOL_SCHEMAS)
+        tool_trace: list[dict[str, object]] = []
+        if required_tool_calls:
+            self._run_tools(messages, required_tool_calls, tool_trace)
+            messages = self._fit_messages(messages, TOOL_SCHEMAS)
         for _ in range(2):
             reply, _ = generate_reply(
                 self.torch,
@@ -346,41 +608,8 @@ class LocalModel:
             )
             calls = parse_tool_calls(reply)
             if not calls:
-                return reply
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": call.name,
-                                "arguments": call.arguments,
-                            },
-                        }
-                        for call in calls
-                    ],
-                }
-            )
-            for call in calls:
-                logging.info("Using tool %s with arguments %r", call.name, call.arguments)
-                tool_result = execute_tool_call(
-                    call,
-                    RETRIEVAL_DATABASE,
-                    GOOGLE_CALENDAR_CREDENTIALS,
-                    GOOGLE_CALENDAR_TOKEN,
-                    GOOGLE_CALENDAR_IDS,
-                    GOOGLE_CALENDAR_TIME_ZONE,
-                )
-                logging.info("Tool %s completed successfully", call.name)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "name": call.name,
-                        "content": tool_result,
-                    }
-                )
+                return ModelGeneration(reply, tuple(tool_trace))
+            self._run_tools(messages, calls, tool_trace)
             messages = self._fit_messages(messages, TOOL_SCHEMAS)
         final_reply, _ = generate_reply(
             self.torch,
@@ -391,7 +620,7 @@ class LocalModel:
             tools=TOOL_SCHEMAS,
             **personal_style_generation_options(),
         )
-        return final_reply
+        return ModelGeneration(final_reply, tuple(tool_trace))
 
 
 @dataclass
@@ -414,6 +643,24 @@ class GenerationRequest:
     result: asyncio.Future[str]
 
 
+@dataclass(frozen=True)
+class ModelGeneration:
+    text: str
+    tool_trace: tuple[dict[str, object], ...] = ()
+
+
+def trim_chat_history(
+    history: list[dict[str, object]],
+    max_user_turns: int,
+) -> None:
+    """Keep complete recent user turns, including their tool traces."""
+    user_positions = [
+        index for index, message in enumerate(history) if message.get("role") == "user"
+    ]
+    if len(user_positions) > max_user_turns:
+        del history[: user_positions[-max_user_turns]]
+
+
 async def generation_worker() -> None:
     """Serialize GPU inference and keep each chat's history in exact reply order."""
     assert generation_queue is not None
@@ -433,13 +680,24 @@ async def generation_worker() -> None:
                     "content": live_system_message(request.relationship, current_time),
                     "role": "system",
                 },
-                *history[-MAX_HISTORY_TURNS * 2 :],
+                *history,
             ]
-            reply = await asyncio.to_thread(model.generate, prompt)
+            required_calls = required_live_tool_calls(
+                request.incoming,
+                history,
+                current_time,
+            )
+            generation = await asyncio.to_thread(
+                model.generate,
+                prompt,
+                required_calls,
+            )
+            reply = generation.text
             if not reply:
                 reply = "I couldn't generate a reply this time."
+            history.extend(generation.tool_trace)
             history.append({"role": "assistant", "content": reply})
-            del history[: max(0, len(history) - MAX_HISTORY_TURNS * 2)]
+            trim_chat_history(history, MAX_HISTORY_TURNS)
             if not request.result.cancelled():
                 request.result.set_result(reply)
         except Exception as exc:
@@ -610,6 +868,13 @@ async def main() -> None:
     load_relationships()
     # Load synchronously before polling: no request can arrive before the model is ready.
     model = LocalModel(BASE_MODEL, resolve_adapter_path(ADAPTER_PATH))
+    logging.info("Loading the RAG embedding model into resident memory")
+    embedding = preload_retrieval_embedding_model(RETRIEVAL_DATABASE)
+    logging.info(
+        "RAG embedding model loaded and resident: %s on %s",
+        embedding["embedding_model"],
+        embedding["embedding_device"],
+    )
     generation_queue = asyncio.Queue()
     worker = asyncio.create_task(generation_worker())
     bot = Bot(token=TOKEN)
@@ -640,4 +905,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(main())
