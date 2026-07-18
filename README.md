@@ -162,7 +162,7 @@ New-Item -ItemType Directory -Force private_data
 Copy-Item .\DataExport_2026-07-17\result.json .\private_data\result.json
 Copy-Item .\.env.example .\.env
 Copy-Item .\config.example.yaml .\config.yaml
-Copy-Item .\relationships.example.json .\private_data\relationships.json
+Copy-Item .\private_data\relationships.example.json .\private_data\relationships.json
 ```
 
 Keep the original export. Before processing, set the correct `owner_from_id` and

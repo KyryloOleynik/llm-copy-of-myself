@@ -9,7 +9,8 @@ __pycache__/
 config.yaml
 DataExport_*/
 .env
-private_data/
+private_data/*
+!private_data/relationships.example.json
 data/bot.sqlite3
 data/retrieval.sqlite3
 data/processed/
